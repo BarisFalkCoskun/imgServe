@@ -40,6 +40,44 @@ def choose_output_format(img: Image.Image, requested_format: str | None) -> str:
     return "webp"
 
 
+def convert_with_rawpy(src: str, dst: str, fmt: str) -> bool:
+    """Camera RAW via libraw — proper demosaic + camera color matrix → sRGB.
+
+    Returns False (without touching dst) for non-RAW inputs so it can sit
+    safely at the head of the backend chain.
+    """
+    if os.path.splitext(src)[1].lower() not in RAW_EXTS:
+        return False
+    try:
+        import rawpy  # soft dependency
+    except ImportError:
+        logger.warning("rawpy not installed; cannot decode RAW %s", src)
+        return False
+
+    try:
+        with rawpy.imread(src) as raw:
+            rgb = raw.postprocess(
+                use_camera_wb=True,
+                output_color=rawpy.ColorSpace.sRGB,
+                output_bps=8,
+                no_auto_bright=False,
+            )
+        img = Image.fromarray(rgb)  # numpy → PIL, mode='RGB'
+        out_fmt = fmt.upper()
+        if out_fmt == "JPG":
+            out_fmt = "JPEG"
+        save_kwargs = {"format": out_fmt}
+        if out_fmt == "WEBP":
+            save_kwargs.update(quality=92, method=6)
+        elif out_fmt == "JPEG":
+            save_kwargs.update(quality=95)
+        img.save(dst, **save_kwargs)
+        return True
+    except Exception as exc:
+        logger.debug("rawpy failed for %s: %s", src, exc)
+        return False
+
+
 def convert_with_pillow(src: str, dst: str, fmt: str) -> bool:
     """Convert using Pillow. Handles PSD (composite), most standard formats."""
     try:
