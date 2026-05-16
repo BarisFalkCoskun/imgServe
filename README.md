@@ -23,7 +23,10 @@ brew install ffmpeg imagemagick libtiff jxrlib
 Debian/Ubuntu:
 
 ```bash
-sudo apt install ffmpeg imagemagick libtiff-tools jxrlib-tools
+sudo apt install ffmpeg imagemagick libtiff-tools
+sudo add-apt-repository universe
+sudo apt update
+sudo apt install libjxr-tools
 ```
 
 **Python:** 3.10+ (uses union types like `str | None`).
