@@ -471,42 +471,23 @@ def main():
     parser.add_argument(
         "--imgs-dir",
         default=DEFAULT_IMGS_BASE,
-        help=f"Images directory (default: {DEFAULT_IMGS_BASE})",
+        help=f"Source images directory (default: {DEFAULT_IMGS_BASE})",
     )
     parser.add_argument(
-        "--cache-dir",
-        default=DEFAULT_CACHE_DIR,
-        help=f"Cache directory (default: {DEFAULT_CACHE_DIR})",
+        "--imgsbackup-dir",
+        default=DEFAULT_IMGSBACKUP_PRIMARY,
+        help=f"Writable canonical WebP store (default: {DEFAULT_IMGSBACKUP_PRIMARY})",
     )
     parser.add_argument(
-        "--cache-max-age-hours",
-        type=int,
-        default=DEFAULT_CACHE_MAX_AGE_HOURS,
-        help=f"Delete converted cache files older than this many hours at startup (default: {DEFAULT_CACHE_MAX_AGE_HOURS})",
-    )
-    parser.add_argument(
-        "--cache-max-bytes",
-        type=int,
-        default=DEFAULT_CACHE_MAX_BYTES,
-        help=f"Keep converted cache near this byte budget; 0 disables size cleanup (default: {DEFAULT_CACHE_MAX_BYTES})",
-    )
-    parser.add_argument(
-        "--stale-lock-age-hours",
-        type=int,
-        default=DEFAULT_STALE_LOCK_AGE_HOURS,
-        help=f"Delete stale lock/tmp files older than this many hours at startup (default: {DEFAULT_STALE_LOCK_AGE_HOURS})",
-    )
-    parser.add_argument(
-        "--min-free-bytes",
-        type=int,
-        default=DEFAULT_MIN_FREE_BYTES,
-        help=f"Reject new conversions below this cache disk free-space floor (default: {DEFAULT_MIN_FREE_BYTES})",
+        "--state-dir",
+        default=DEFAULT_STATE_DIR,
+        help=f"Directory for conversion slot lock files (default: {DEFAULT_STATE_DIR})",
     )
     parser.add_argument(
         "--health-min-free-bytes",
         type=int,
         default=DEFAULT_HEALTH_MIN_FREE_BYTES,
-        help=f"Mark /health unhealthy below this cache disk free-space floor (default: {DEFAULT_HEALTH_MIN_FREE_BYTES})",
+        help=f"Mark /health unhealthy below this imgsbackup free-space floor (default: {DEFAULT_HEALTH_MIN_FREE_BYTES})",
     )
     parser.add_argument(
         "--conversion-slots",
@@ -523,65 +504,37 @@ def main():
             f"(default: {DEFAULT_CONVERSION_SLOT_TIMEOUT_SECONDS})"
         ),
     )
-    parser.add_argument(
-        "--cache-cleanup-interval-seconds",
-        type=int,
-        default=DEFAULT_CACHE_CLEANUP_INTERVAL_SECONDS,
-        help=(
-            "Minimum interval between pre-conversion cache cleanup passes; 0 disables periodic cleanup "
-            f"(default: {DEFAULT_CACHE_CLEANUP_INTERVAL_SECONDS})"
-        ),
-    )
-    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Number of workers (default: {DEFAULT_WORKERS})")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                        help=f"Number of workers (default: {DEFAULT_WORKERS})")
     args = parser.parse_args()
 
-    if args.cache_max_age_hours < 0:
-        parser.error("--cache-max-age-hours must be >= 0")
-    if args.cache_max_bytes < 0:
-        parser.error("--cache-max-bytes must be >= 0")
-    if args.stale_lock_age_hours < 0:
-        parser.error("--stale-lock-age-hours must be >= 0")
-    if args.min_free_bytes < 0:
-        parser.error("--min-free-bytes must be >= 0")
     if args.health_min_free_bytes < 0:
         parser.error("--health-min-free-bytes must be >= 0")
     if args.conversion_slots <= 0:
         parser.error("--conversion-slots must be > 0")
     if args.conversion_slot_timeout_seconds < 0:
         parser.error("--conversion-slot-timeout-seconds must be >= 0")
-    if args.cache_cleanup_interval_seconds < 0:
-        parser.error("--cache-cleanup-interval-seconds must be >= 0")
     if args.workers <= 0:
         parser.error("--workers must be > 0")
 
     imgs_dir = os.path.abspath(args.imgs_dir)
-    cache_dir = os.path.abspath(args.cache_dir)
+    imgsbackup_dir = os.path.abspath(args.imgsbackup_dir)
+    state_dir = os.path.abspath(args.state_dir)
     os.environ[ENV_IMGS_DIR] = imgs_dir
-    os.environ[ENV_CACHE_DIR] = cache_dir
-    os.environ[ENV_CACHE_MAX_AGE_HOURS] = str(args.cache_max_age_hours)
-    os.environ[ENV_CACHE_MAX_BYTES] = str(args.cache_max_bytes)
-    os.environ[ENV_STALE_LOCK_AGE_HOURS] = str(args.stale_lock_age_hours)
-    os.environ[ENV_MIN_FREE_BYTES] = str(args.min_free_bytes)
+    os.environ[ENV_IMGSBACKUP_PRIMARY] = imgsbackup_dir
+    os.environ[ENV_STATE_DIR] = state_dir
     os.environ[ENV_HEALTH_MIN_FREE_BYTES] = str(args.health_min_free_bytes)
     os.environ[ENV_CONVERSION_SLOTS] = str(args.conversion_slots)
     os.environ[ENV_CONVERSION_SLOT_TIMEOUT_SECONDS] = str(args.conversion_slot_timeout_seconds)
-    os.environ[ENV_CACHE_CLEANUP_INTERVAL_SECONDS] = str(args.cache_cleanup_interval_seconds)
-    os.makedirs(cache_dir, exist_ok=True)
+    os.makedirs(state_dir, exist_ok=True)
 
-    logger.info("Optimized WebP directories: %s", ", ".join(IMGSBACKUP_READ_DIRS))
-    logger.info("Serving images from: %s", imgs_dir)
-    logger.info("Cache directory: %s", cache_dir)
-    logger.info("Cache max age (hours): %s", args.cache_max_age_hours)
-    logger.info(
-        "Cache max bytes: %s",
-        "disabled" if args.cache_max_bytes == 0 else _format_bytes(args.cache_max_bytes),
-    )
-    logger.info("Stale lock max age (hours): %s", args.stale_lock_age_hours)
-    logger.info("Minimum free bytes for conversions: %s", _format_bytes(args.min_free_bytes))
-    logger.info("Minimum free bytes for health: %s", _format_bytes(args.health_min_free_bytes))
+    logger.info("Optimized WebP read dirs: %s", ", ".join(IMGSBACKUP_READ_DIRS))
+    logger.info("Source images: %s", imgs_dir)
+    logger.info("imgsbackup write target: %s", imgsbackup_dir)
+    logger.info("State dir (conversion slot locks): %s", state_dir)
+    logger.info("Health min free bytes: %s", _format_bytes(args.health_min_free_bytes))
     logger.info("Conversion slots: %s", args.conversion_slots)
     logger.info("Conversion slot timeout seconds: %s", args.conversion_slot_timeout_seconds)
-    logger.info("Cache cleanup interval seconds: %s", args.cache_cleanup_interval_seconds)
     logger.info("Listening on: %s:%s", args.host, args.port)
 
     uvicorn.run(
