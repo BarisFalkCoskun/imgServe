@@ -36,6 +36,7 @@ import fcntl
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 
 from converter import (
     FORMAT_TO_EXT,
@@ -640,6 +641,13 @@ def promote_to_imgsbackup(local_path: str, imgsbackup_dir: str, folder: str, fil
         return False
 
 
+def _safe_unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def find_optimized_webp(folder: str, filename: str) -> str | None:
     basename = os.path.splitext(filename)[0]
     webp_name = f"{basename}.webp"
@@ -723,145 +731,101 @@ def create_app() -> FastAPI:
         folder = _validate_path_component(folder, "folder")
         filename = _validate_path_component(filename, "filename")
 
+        # 1. Cached canonical WebP — fast path.
         if format is None or format.lower() == "webp":
             optimized = find_optimized_webp(folder, filename)
             if optimized is not None:
                 logger.debug(
                     "Serving optimized WebP: pid=%s image=%s/%s path=%s",
-                    os.getpid(),
-                    folder,
-                    filename,
-                    optimized,
+                    os.getpid(), folder, filename, optimized,
                 )
-                return _file_response(optimized, media_type="image/webp", cache_control=IMMUTABLE_CACHE_CONTROL)
+                return _file_response(optimized, media_type="image/webp",
+                                      cache_control=IMMUTABLE_CACHE_CONTROL)
 
+        # 2. Source must exist.
         src_path = os.path.join(request.app.state.imgs_dir, folder, filename)
         if not os.path.isfile(src_path):
             raise HTTPException(status_code=404, detail="Image not found")
 
         ext = os.path.splitext(filename)[1].lower()
-        out_fmt = None
-        if format:
-            format = format.lower()
-            if format not in FORMAT_TO_EXT:
-                raise HTTPException(status_code=400, detail=f"Unsupported format: {format}")
-            out_fmt = format
 
-        if not needs_conversion(ext) and not out_fmt:
-            logger.debug("Serving source image directly: pid=%s image=%s/%s", os.getpid(), folder, filename)
+        # 3. Passthrough — video, html, pdf, or anything we can't convert.
+        if is_passthrough(ext):
+            logger.debug(
+                "Passthrough source: pid=%s image=%s/%s ext=%s",
+                os.getpid(), folder, filename, ext,
+            )
             return _file_response(
                 src_path,
                 media_type=get_content_type(ext),
                 cache_control=DIRECT_SOURCE_CACHE_CONTROL,
             )
 
-        if not out_fmt:
-            out_fmt = "png"
+        # 4. Decide output format.
+        if format:
+            fmt_lower = format.lower()
+            if fmt_lower not in FORMAT_TO_EXT:
+                raise HTTPException(status_code=400, detail=f"Unsupported format: {format}")
+            out_fmt = fmt_lower
+        else:
+            out_fmt = "webp"
 
-        src_stat = os.stat(src_path)
         out_ext = FORMAT_TO_EXT[out_fmt]
-        cache_path, lock_path = _build_cache_paths(
-            request.app.state.cache_dir,
-            folder,
-            filename,
-            out_ext,
-            src_stat.st_size,
-            src_stat.st_mtime_ns,
-        )
         content_type = get_content_type(out_ext)
 
-        if os.path.isfile(cache_path):
-            logger.debug(
-                "Serving cached conversion: pid=%s image=%s/%s format=%s path=%s",
-                os.getpid(),
-                folder,
-                filename,
-                out_fmt,
-                cache_path,
-            )
-            return _file_response(cache_path, media_type=content_type, cache_control=IMMUTABLE_CACHE_CONTROL)
+        # 5. Convert in /tmp under a conversion slot.
+        src_size = os.path.getsize(src_path)
+        conversion_started_at = time.monotonic()
+        logger.info(
+            "Conversion queued: pid=%s image=%s/%s format=%s src_bytes=%s",
+            os.getpid(), folder, filename, out_fmt, src_size,
+        )
 
-        with _cache_lock(lock_path) as file_lock_wait_seconds:
-            if os.path.isfile(cache_path):
-                logger.info(
-                    "Cache filled by another worker: pid=%s image=%s/%s format=%s file_lock_wait_seconds=%.3f",
-                    os.getpid(),
-                    folder,
-                    filename,
-                    out_fmt,
-                    file_lock_wait_seconds,
-                )
-                return _file_response(cache_path, media_type=content_type, cache_control=IMMUTABLE_CACHE_CONTROL)
-
-            _maybe_run_cache_cleanup(
-                request.app.state.cache_dir,
-                cache_cleanup_interval_seconds=request.app.state.cache_cleanup_interval_seconds,
-                cache_max_age_hours=request.app.state.cache_max_age_hours,
-                stale_lock_age_hours=request.app.state.stale_lock_age_hours,
-                cache_max_bytes=request.app.state.cache_max_bytes,
-            )
-            free_before_bytes = _ensure_cache_storage(
-                request.app.state.cache_dir,
-                min_free_bytes=request.app.state.min_free_bytes,
-                cache_max_age_hours=request.app.state.cache_max_age_hours,
-                stale_lock_age_hours=request.app.state.stale_lock_age_hours,
-                cache_max_bytes=request.app.state.cache_max_bytes,
-            )
-
-            conversion_started_at = time.monotonic()
-            logger.info(
-                "Conversion queued: pid=%s image=%s/%s format=%s src_bytes=%s free_before=%s "
-                "file_lock_wait_seconds=%.3f",
-                os.getpid(),
-                folder,
-                filename,
-                out_fmt,
-                src_stat.st_size,
-                _format_bytes(free_before_bytes),
-                file_lock_wait_seconds,
-            )
+        tmp_fd, tmp_out = tempfile.mkstemp(prefix="imgserve-", suffix=out_ext)
+        os.close(tmp_fd)
+        try:
             with _conversion_slot(
                 request.app.state.state_dir,
                 slot_count=request.app.state.conversion_slots,
                 timeout_seconds=request.app.state.conversion_slot_timeout_seconds,
             ) as (slot_index, slot_wait_seconds):
                 logger.info(
-                    "Conversion started: pid=%s slot=%s image=%s/%s format=%s "
-                    "slot_wait_seconds=%.3f",
-                    os.getpid(),
-                    slot_index,
+                    "Conversion started: pid=%s slot=%s image=%s/%s format=%s slot_wait_seconds=%.3f",
+                    os.getpid(), slot_index, folder, filename, out_fmt, slot_wait_seconds,
+                )
+                success = convert_image(src_path, tmp_out, out_fmt)
+
+            if not success:
+                raise HTTPException(status_code=500, detail="Conversion failed")
+
+            output_bytes = os.path.getsize(tmp_out)
+            duration_seconds = time.monotonic() - conversion_started_at
+
+            # 6. Write-back only for canonical WebP. Fail-soft.
+            if out_fmt == "webp":
+                promote_to_imgsbackup(
+                    tmp_out,
+                    request.app.state.imgsbackup_dir,
                     folder,
                     filename,
-                    out_fmt,
-                    slot_wait_seconds,
                 )
-                success = _convert_into_cache(src_path, cache_path, out_fmt)
 
-            duration_seconds = time.monotonic() - conversion_started_at
-            output_bytes = os.path.getsize(cache_path) if success and os.path.isfile(cache_path) else 0
-            free_after_bytes = shutil.disk_usage(request.app.state.cache_dir).free
             logger.info(
-                "Conversion finished: pid=%s image=%s/%s format=%s success=%s duration_seconds=%.3f "
-                "slot_wait_seconds=%.3f file_lock_wait_seconds=%.3f src_bytes=%s output_bytes=%s "
-                "free_before=%s free_after=%s",
-                os.getpid(),
-                folder,
-                filename,
-                out_fmt,
-                success,
-                duration_seconds,
-                slot_wait_seconds,
-                file_lock_wait_seconds,
-                src_stat.st_size,
-                output_bytes,
-                _format_bytes(free_before_bytes),
-                _format_bytes(free_after_bytes),
+                "Conversion finished: pid=%s image=%s/%s format=%s duration_seconds=%.3f "
+                "src_bytes=%s output_bytes=%s",
+                os.getpid(), folder, filename, out_fmt, duration_seconds, src_size, output_bytes,
             )
 
-        if not success:
-            raise HTTPException(status_code=500, detail="Conversion failed")
-
-        return _file_response(cache_path, media_type=content_type, cache_control=IMMUTABLE_CACHE_CONTROL)
+            return FileResponse(
+                tmp_out,
+                media_type=content_type,
+                headers={"Cache-Control": IMMUTABLE_CACHE_CONTROL},
+                background=BackgroundTask(_safe_unlink, tmp_out),
+            )
+        except Exception:
+            # If we never returned a FileResponse, clean up the temp file now.
+            _safe_unlink(tmp_out)
+            raise
 
     return app
 
