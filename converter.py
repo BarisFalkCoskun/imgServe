@@ -177,6 +177,11 @@ def get_content_type(ext: str) -> str:
         ".svg": "image/svg+xml",
         ".tif": "image/tiff",
         ".tiff": "image/tiff",
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".m4v": "video/x-m4v",
+        ".html": "text/html; charset=utf-8",
+        ".pdf": "application/pdf",
     }
     return types.get(ext.lower(), "application/octet-stream")
 
