@@ -652,3 +652,22 @@ fe3377ae9922fd9e2717d066625ef5b27585a5490702d7304875a1008c1d4182.webp
 0f075ce4a3fd9c0d9eb7e37d4382e3a49f16bbe7ca97a54221a8d60068ad1642.webp
 logsv7/*
 outputAll.txt
+
+# imgServe runtime
+cache/
+state/
+tests/fixtures/*.psd
+tests/fixtures/*.tif
+tests/fixtures/*.tiff
+tests/fixtures/*.png
+tests/fixtures/*.jpg
+tests/fixtures/*.jpeg
+tests/fixtures/*.webp
+tests/fixtures/*.gif
+tests/fixtures/*.bmp
+tests/fixtures/*.mp4
+tests/fixtures/*.mov
+tests/fixtures/*.m4v
+tests/fixtures/*.html
+tests/fixtures/*.pdf
+tests/fixtures/*.dng
