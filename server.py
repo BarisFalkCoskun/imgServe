@@ -464,12 +464,12 @@ def _check_cache_dir(cache_dir: str, min_free_bytes: int) -> dict[str, object]:
     return status
 
 
-def _health_payload(imgs_dir: str, cache_dir: str, health_min_free_bytes: int) -> tuple[dict[str, object], int]:
+def _health_payload(imgs_dir: str, imgsbackup_dir: str, health_min_free_bytes: int) -> tuple[dict[str, object], int]:
     optimized_webp = _check_optimized_webp_dirs()
     fallback_source = _check_readable_dir(imgs_dir)
-    cache = _check_cache_dir(cache_dir, health_min_free_bytes)
+    imgsbackup = _check_imgsbackup_write(imgsbackup_dir, health_min_free_bytes)
     source_available = bool(optimized_webp.get("ok")) or bool(fallback_source.get("ok"))
-    healthy = source_available and bool(cache.get("ok"))
+    healthy = source_available and bool(imgsbackup.get("ok"))
 
     return {
         "status": "ok" if healthy else "error",
@@ -477,7 +477,7 @@ def _health_payload(imgs_dir: str, cache_dir: str, health_min_free_bytes: int) -
         "checks": {
             "optimized_webp": optimized_webp,
             "fallback_source": fallback_source,
-            "cache": cache,
+            "imgsbackup": imgsbackup,
         },
     }, (200 if healthy else 503)
 
@@ -716,7 +716,7 @@ def create_app() -> FastAPI:
     def health(request: Request):
         payload, status_code = _health_payload(
             request.app.state.imgs_dir,
-            request.app.state.cache_dir,
+            request.app.state.imgsbackup_dir,
             request.app.state.health_min_free_bytes,
         )
         return JSONResponse(payload, status_code=status_code)
