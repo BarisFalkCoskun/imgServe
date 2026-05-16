@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """
-imgServe — Internal image server with on-the-fly format conversion.
+imgServe — Internal image server with write-through conversion.
 
-Serves optimized WebP images from /mnt/imgsbackup/imgs3/ when available,
-mapping incoming legacy file extensions to .webp while keeping the original
-folder structure. Falls back to /mnt/storagebox/imgs/ with automatic
-conversion of non-web-friendly formats (PSD, TIFF, DNG, NEF, ARW, JXR, etc.)
-to PNG/JPG/WebP. Converted images are cached on the local SSD.
+Serves canonical WebP from /mnt/imgsbackup/imgs3/ when available. On miss,
+falls back to /mnt/storagebox/imgs/, converts the source to WebP in /tmp,
+streams the result, and promotes the WebP into /mnt/imgsbackup/imgs3/ via
+atomic rename so future requests skip conversion entirely.
+
+Non-image types (.mp4, .mov, .m4v, .html, .pdf, plus any unrecognized
+extension) are streamed from the source with the correct Content-Type.
+
+Camera RAW (.nef, .arw, .dng, .cr2, .cr3, .raf, .rw2, .orf, .pef, .srw)
+is decoded via libraw (rawpy) for proper demosaicing — no channel
+separation artifacts.
 
 Binds to 127.0.0.1 only — not accessible from the internet.
 
 Usage:
   python3 server.py
   python3 server.py --port 8100
-  python3 server.py --cache-dir /path/to/cache
+  python3 server.py --imgsbackup-dir /mnt/imgsbackup/imgs3
 
 Request examples:
   GET /imgs/fillop/48e04f71...d956b4.jpg              → serves optimized WebP
-  GET /imgs/fillop/48e04f71...d956b4.psd              → auto-converts to PNG
-  GET /imgs/fillop/48e04f71...d956b4.psd?format=webp  → converts to WebP
-  GET /imgs/bilka/abc123.jpg                          → serves optimized WebP when present
+                                                        (converts + writes back on first hit)
+  GET /imgs/fillop/48e04f71...d956b4.psd              → converts to WebP, writes back
+  GET /imgs/fillop/48e04f71...d956b4.psd?format=png   → converts to PNG (not cached)
+  GET /imgs/clips/intro.mp4                           → streams source as video/mp4
   GET /health                                         → health check
 """
 
