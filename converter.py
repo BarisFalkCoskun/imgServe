@@ -260,6 +260,7 @@ def convert_image(src_path: str, dst_path: str, fmt: str = "png") -> bool:
 
     # Try backends in order
     backends = [
+        ("rawpy", convert_with_rawpy),       # short-circuits False for non-RAW
         ("Pillow", convert_with_pillow),
         ("ImageMagick", convert_with_magick),
         ("ffmpeg", convert_with_ffmpeg),

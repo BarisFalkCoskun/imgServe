@@ -58,3 +58,14 @@ def test_choose_output_format_respects_request():
     img = Image.new("RGB", (4, 4), (10, 20, 30))
     assert choose_output_format(img, "PNG") == "png"
     assert choose_output_format(img, "jpg") == "jpg"
+
+
+from converter import convert_image
+
+
+def test_convert_image_handles_jpg_to_webp(tmp_path):
+    src = tmp_path / "src.jpg"
+    Image.new("RGB", (8, 8), (200, 100, 50)).save(src, format="JPEG")
+    dst = tmp_path / "out.webp"
+    assert convert_image(str(src), str(dst), "webp") is True
+    assert Image.open(dst).format == "WEBP"
