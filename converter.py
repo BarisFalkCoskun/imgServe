@@ -84,12 +84,31 @@ def convert_with_pillow(src: str, dst: str, fmt: str) -> bool:
         with Image.open(src) as img:
             img.load()
 
+            # Apply embedded ICC profile → sRGB for color-accurate output.
+            # Best-effort: failures fall through to today's behavior.
+            icc = img.info.get("icc_profile")
+            if icc and img.mode in ("RGB", "RGBA", "L", "LA"):
+                try:
+                    import io
+                    from PIL import ImageCms
+                    src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+                    dst_profile = ImageCms.createProfile("sRGB")
+                    out_mode = "RGBA" if has_transparency(img) else "RGB"
+                    img = ImageCms.profileToProfile(
+                        img,
+                        inputProfile=src_profile,
+                        outputProfile=dst_profile,
+                        renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC,
+                        outputMode=out_mode,
+                    )
+                except Exception as exc:
+                    logger.debug("ICC convert failed for %s: %s", src, exc)
+
             out_fmt = fmt.upper()
             if out_fmt == "JPG":
                 out_fmt = "JPEG"
 
             if out_fmt == "JPEG" and img.mode in ("RGBA", "LA", "PA", "P"):
-                # JPEG doesn't support transparency — composite onto white
                 bg = Image.new("RGB", img.size, (255, 255, 255))
                 if img.mode == "P":
                     img = img.convert("RGBA")
@@ -100,7 +119,10 @@ def convert_with_pillow(src: str, dst: str, fmt: str) -> bool:
             elif img.mode == "CMYK":
                 img = img.convert("RGBA" if has_transparency(img) else "RGB")
 
-            img.save(dst, format=out_fmt, quality=95)
+            save_kwargs = {"format": out_fmt, "quality": 95}
+            if out_fmt == "WEBP":
+                save_kwargs["method"] = 6
+            img.save(dst, **save_kwargs)
             return True
     except Exception as e:
         logger.debug(f"Pillow failed for {src}: {e}")

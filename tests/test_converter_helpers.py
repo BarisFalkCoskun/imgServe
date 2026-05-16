@@ -69,3 +69,13 @@ def test_convert_image_handles_jpg_to_webp(tmp_path):
     dst = tmp_path / "out.webp"
     assert convert_image(str(src), str(dst), "webp") is True
     assert Image.open(dst).format == "WEBP"
+
+
+def test_pillow_converts_png_without_icc(tmp_path):
+    src = tmp_path / "src.png"
+    Image.new("RGB", (8, 8), (10, 200, 10)).save(src, format="PNG")
+    dst = tmp_path / "out.webp"
+    from converter import convert_with_pillow
+    assert convert_with_pillow(str(src), str(dst), "webp") is True
+    img = Image.open(dst)
+    assert img.format == "WEBP" and img.size == (8, 8)
