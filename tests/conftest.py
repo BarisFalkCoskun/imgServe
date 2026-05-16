@@ -44,7 +44,6 @@ def app(env_dirs, monkeypatch):
     monkeypatch.setenv(server.ENV_STATE_DIR, str(env_dirs["state"]))
     monkeypatch.setenv(server.ENV_CONVERSION_SLOTS, "2")
     monkeypatch.setenv(server.ENV_CONVERSION_SLOT_TIMEOUT_SECONDS, "5")
-    monkeypatch.setattr(server, "IMGSBACKUP_READ_DIRS", [str(env_dirs["backup"])])
     return server.create_app()
 
 

@@ -1,6 +1,5 @@
 from unittest.mock import patch
-
-import pytest
+from fastapi.testclient import TestClient
 
 import server
 
@@ -39,6 +38,22 @@ def test_webp_source_with_existing_backup_serves_backup(client, put_source, put_
 
     with patch.object(server, "convert_image") as mock_convert:
         r = client.get(f"/imgs/demo/{src.name}")
+    assert r.status_code == 200
+    assert r.content == backup_file.read_bytes()
+    assert mock_convert.call_count == 0
+
+
+def test_existing_backup_uses_runtime_imgsbackup_dir_without_source(env_dirs, put_backup, monkeypatch):
+    backup_file = put_backup("solid_source.webp", folder="demo", as_name="solid.webp")
+    monkeypatch.setenv(server.ENV_IMGS_DIR, str(env_dirs["imgs"]))
+    monkeypatch.setenv(server.ENV_IMGSBACKUP_PRIMARY, str(env_dirs["backup"]))
+    monkeypatch.setenv(server.ENV_STATE_DIR, str(env_dirs["state"]))
+
+    app = server.create_app()
+    with TestClient(app) as test_client:
+        with patch.object(server, "convert_image") as mock_convert:
+            r = test_client.get("/imgs/demo/solid.psd")
+
     assert r.status_code == 200
     assert r.content == backup_file.read_bytes()
     assert mock_convert.call_count == 0

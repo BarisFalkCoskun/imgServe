@@ -58,9 +58,6 @@ DEFAULT_HEALTH_MIN_FREE_BYTES = 1 * 1024 * 1024 * 1024
 DEFAULT_CONVERSION_SLOTS = 1
 DEFAULT_CONVERSION_SLOT_TIMEOUT_SECONDS = 30
 DEFAULT_WORKERS = 2
-IMGSBACKUP_READ_DIRS = [
-    "/mnt/imgsbackup/imgs3",
-]
 ENV_IMGS_DIR = "IMGSERVE_IMGS_DIR"
 ENV_HEALTH_MIN_FREE_BYTES = "IMGSERVE_HEALTH_MIN_FREE_BYTES"
 ENV_CONVERSION_SLOTS = "IMGSERVE_CONVERSION_SLOTS"
@@ -164,8 +161,8 @@ def _check_readable_dir(path: str) -> dict[str, object]:
     return status
 
 
-def _check_optimized_webp_dirs() -> dict[str, object]:
-    checks = [_check_readable_dir(path) for path in IMGSBACKUP_READ_DIRS]
+def _check_optimized_webp_dirs(imgsbackup_read_dirs: list[str]) -> dict[str, object]:
+    checks = [_check_readable_dir(path) for path in imgsbackup_read_dirs]
     return {
         "ok": any(bool(check.get("ok")) for check in checks),
         "paths": checks,
@@ -201,8 +198,13 @@ def _check_imgsbackup_write(imgsbackup_dir: str, min_free_bytes: int) -> dict[st
     return status
 
 
-def _health_payload(imgs_dir: str, imgsbackup_dir: str, health_min_free_bytes: int) -> tuple[dict[str, object], int]:
-    optimized_webp = _check_optimized_webp_dirs()
+def _health_payload(
+    imgs_dir: str,
+    imgsbackup_dir: str,
+    imgsbackup_read_dirs: list[str],
+    health_min_free_bytes: int,
+) -> tuple[dict[str, object], int]:
+    optimized_webp = _check_optimized_webp_dirs(imgsbackup_read_dirs)
     fallback_source = _check_readable_dir(imgs_dir)
     imgsbackup = _check_imgsbackup_write(imgsbackup_dir, health_min_free_bytes)
     source_available = bool(optimized_webp.get("ok")) or bool(fallback_source.get("ok"))
@@ -316,10 +318,10 @@ def _safe_unlink(path: str) -> None:
         pass
 
 
-def find_optimized_webp(folder: str, filename: str) -> str | None:
+def find_optimized_webp(folder: str, filename: str, imgsbackup_read_dirs: list[str]) -> str | None:
     basename = os.path.splitext(filename)[0]
     webp_name = f"{basename}.webp"
-    for base in IMGSBACKUP_READ_DIRS:
+    for base in imgsbackup_read_dirs:
         candidate = os.path.join(base, folder, webp_name)
         try:
             if os.path.isfile(candidate):
@@ -329,7 +331,7 @@ def find_optimized_webp(folder: str, filename: str) -> str | None:
     return None
 
 
-def create_app() -> FastAPI:
+def create_app(log_config: bool = True) -> FastAPI:
     app = FastAPI(title="imgServe", docs_url=None, redoc_url=None)
     app.state.imgs_dir = _configured_path(ENV_IMGS_DIR, DEFAULT_IMGS_BASE)
     app.state.health_min_free_bytes = _configured_nonnegative_int(
@@ -345,14 +347,24 @@ def create_app() -> FastAPI:
         DEFAULT_CONVERSION_SLOT_TIMEOUT_SECONDS,
     )
     app.state.imgsbackup_dir = _configured_path(ENV_IMGSBACKUP_PRIMARY, DEFAULT_IMGSBACKUP_PRIMARY)
+    app.state.imgsbackup_read_dirs = [app.state.imgsbackup_dir]
     app.state.state_dir = _configured_path(ENV_STATE_DIR, DEFAULT_STATE_DIR)
     os.makedirs(app.state.state_dir, exist_ok=True)
+    if log_config:
+        logger.info(
+            "App configured: imgs_dir=%s imgsbackup_write=%s imgsbackup_read_dirs=%s state_dir=%s",
+            app.state.imgs_dir,
+            app.state.imgsbackup_dir,
+            ", ".join(app.state.imgsbackup_read_dirs),
+            app.state.state_dir,
+        )
 
     @app.get("/health")
     def health(request: Request):
         payload, status_code = _health_payload(
             request.app.state.imgs_dir,
             request.app.state.imgsbackup_dir,
+            request.app.state.imgsbackup_read_dirs,
             request.app.state.health_min_free_bytes,
         )
         return JSONResponse(payload, status_code=status_code)
@@ -369,7 +381,7 @@ def create_app() -> FastAPI:
 
         # 1. Cached canonical WebP — fast path.
         if format is None or format.lower() == "webp":
-            optimized = find_optimized_webp(folder, filename)
+            optimized = find_optimized_webp(folder, filename, request.app.state.imgsbackup_read_dirs)
             if optimized is not None:
                 logger.debug(
                     "Serving optimized WebP: pid=%s image=%s/%s path=%s",
@@ -466,7 +478,7 @@ def create_app() -> FastAPI:
     return app
 
 
-app = create_app()
+app = create_app(log_config=False)
 
 
 def main():
@@ -533,11 +545,7 @@ def main():
     os.environ[ENV_CONVERSION_SLOT_TIMEOUT_SECONDS] = str(args.conversion_slot_timeout_seconds)
     os.makedirs(state_dir, exist_ok=True)
 
-    # Read lookups must reflect the runtime imgsbackup target, not the module default.
-    global IMGSBACKUP_READ_DIRS
-    IMGSBACKUP_READ_DIRS = [imgsbackup_dir]
-
-    logger.info("Optimized WebP read dirs: %s", ", ".join(IMGSBACKUP_READ_DIRS))
+    logger.info("Optimized WebP read dirs: %s", imgsbackup_dir)
     logger.info("Source images: %s", imgs_dir)
     logger.info("imgsbackup write target: %s", imgsbackup_dir)
     logger.info("State dir (conversion slot locks): %s", state_dir)

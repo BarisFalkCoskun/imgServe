@@ -86,7 +86,7 @@
 |---|---|
 | Source | `/mnt/storagebox/imgs/{folder}/{filename}` |
 | Backup primary (read+write) | `/mnt/imgsbackup/imgs3/{folder}/{basename}.webp` |
-| Backup additional (read-only) | future entries in `IMGSBACKUP_READ_DIRS` |
+| Backup additional (read-only) | future entries in runtime `app.state.imgsbackup_read_dirs` |
 | Backup temp during write | `/mnt/imgsbackup/imgs3/{folder}/.{basename}.{pid}.{rand}.tmp` |
 | Conversion scratch | `/tmp/imgserve-{rand}.webp` |
 | State (fcntl slot locks) | `./state/.conversion-slots/slot-{n}.lock` |
@@ -115,7 +115,7 @@
 - All references in `serve_image` to the cache (`_build_cache_paths`, `_cache_lock`, `_maybe_run_cache_cleanup`, `_ensure_cache_storage`, the "cache hit" branch, the "filled by another worker" branch).
 
 **Rename:**
-- `IMGSBACKUP_DIRS` → `IMGSBACKUP_READ_DIRS` (still a list for read fallback). Keep `/mnt/imgsbackup/imgs3` as the only element by default.
+- Runtime read fallback lives on `app.state.imgsbackup_read_dirs` so worker-created app instances use the same imgsbackup path as the write target.
 - `CACHE_CONVERSION_SLOTS_DIR_NAME` stays (used by `_conversion_slot`), but the parent dir is now `state_dir`, not `cache_dir`.
 
 **Add:**
