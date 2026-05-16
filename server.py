@@ -37,10 +37,19 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 
-from converter import FORMAT_TO_EXT, convert_image, get_content_type, needs_conversion
+from converter import (
+    FORMAT_TO_EXT,
+    PASSTHROUGH_EXTS,
+    convert_image,
+    get_content_type,
+    is_passthrough,
+    needs_conversion,
+)
 
 DEFAULT_IMGS_BASE = "/mnt/storagebox/imgs"
 DEFAULT_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+DEFAULT_IMGSBACKUP_PRIMARY = "/mnt/imgsbackup/imgs3"
+DEFAULT_STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
 DEFAULT_CACHE_MAX_AGE_HOURS = 24 * 30
 DEFAULT_CACHE_MAX_BYTES = 12 * 1024 * 1024 * 1024
 DEFAULT_STALE_LOCK_AGE_HOURS = 6
@@ -50,7 +59,7 @@ DEFAULT_CONVERSION_SLOTS = 1
 DEFAULT_CONVERSION_SLOT_TIMEOUT_SECONDS = 30
 DEFAULT_CACHE_CLEANUP_INTERVAL_SECONDS = 300
 DEFAULT_WORKERS = 2
-IMGSBACKUP_DIRS = [
+IMGSBACKUP_READ_DIRS = [
     "/mnt/imgsbackup/imgs3",
 ]
 ENV_IMGS_DIR = "IMGSERVE_IMGS_DIR"
@@ -63,6 +72,8 @@ ENV_HEALTH_MIN_FREE_BYTES = "IMGSERVE_HEALTH_MIN_FREE_BYTES"
 ENV_CONVERSION_SLOTS = "IMGSERVE_CONVERSION_SLOTS"
 ENV_CONVERSION_SLOT_TIMEOUT_SECONDS = "IMGSERVE_CONVERSION_SLOT_TIMEOUT_SECONDS"
 ENV_CACHE_CLEANUP_INTERVAL_SECONDS = "IMGSERVE_CACHE_CLEANUP_INTERVAL_SECONDS"
+ENV_IMGSBACKUP_PRIMARY = "IMGSERVE_IMGSBACKUP_DIR"
+ENV_STATE_DIR = "IMGSERVE_STATE_DIR"
 CACHE_KEY_VERSION = "v2"
 CACHE_CLEANUP_LOCK_NAME = ".cache-cleanup.lock"
 CACHE_CLEANUP_LAST_NAME = ".cache-cleanup-last"
@@ -385,11 +396,40 @@ def _check_readable_dir(path: str) -> dict[str, object]:
 
 
 def _check_optimized_webp_dirs() -> dict[str, object]:
-    checks = [_check_readable_dir(path) for path in IMGSBACKUP_DIRS]
+    checks = [_check_readable_dir(path) for path in IMGSBACKUP_READ_DIRS]
     return {
         "ok": any(bool(check.get("ok")) for check in checks),
         "paths": checks,
     }
+
+
+def _check_imgsbackup_write(imgsbackup_dir: str, min_free_bytes: int) -> dict[str, object]:
+    status: dict[str, object] = {"path": imgsbackup_dir}
+    try:
+        if not os.path.isdir(imgsbackup_dir):
+            raise FileNotFoundError(f"{imgsbackup_dir} is not a directory")
+        if not os.access(imgsbackup_dir, os.W_OK | os.X_OK):
+            raise PermissionError(f"{imgsbackup_dir} is not writable")
+        with tempfile.NamedTemporaryFile(dir=imgsbackup_dir, prefix=".health-", delete=True) as tmp:
+            tmp.write(b"ok")
+            tmp.flush()
+        usage = shutil.disk_usage(imgsbackup_dir)
+    except Exception as exc:
+        status["ok"] = False
+        status["error"] = str(exc)
+        return status
+
+    status["free_bytes"] = usage.free
+    status["total_bytes"] = usage.total
+    status["min_free_bytes"] = min_free_bytes
+    status["free_ok"] = usage.free >= min_free_bytes
+    status["ok"] = bool(status["free_ok"])
+    if not status["ok"]:
+        status["error"] = (
+            f"free disk below threshold: {_format_bytes(usage.free)} "
+            f"< {_format_bytes(min_free_bytes)}"
+        )
+    return status
 
 
 def _check_cache_dir(cache_dir: str, min_free_bytes: int) -> dict[str, object]:
@@ -564,10 +604,46 @@ def _file_response(path: str, media_type: str, cache_control: str) -> FileRespon
     return FileResponse(path, media_type=media_type, headers={"Cache-Control": cache_control})
 
 
+def promote_to_imgsbackup(local_path: str, imgsbackup_dir: str, folder: str, filename: str) -> bool:
+    """Copy a freshly-converted WebP into imgsbackup atomically.
+
+    Returns True on success, False on any OSError. Failure is logged at WARNING
+    but does not raise — the caller still serves the local bytes.
+    """
+    basename = os.path.splitext(filename)[0]
+    dest_dir = os.path.join(imgsbackup_dir, folder)
+    dest_path = os.path.join(dest_dir, f"{basename}.webp")
+    tmp_name = f".{basename}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
+    tmp_path = os.path.join(dest_dir, tmp_name)
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        shutil.copyfile(local_path, tmp_path)
+        os.rename(tmp_path, dest_path)
+        logger.info(
+            "Promoted to imgsbackup: pid=%s path=%s bytes=%s",
+            os.getpid(),
+            dest_path,
+            os.path.getsize(dest_path),
+        )
+        return True
+    except OSError as exc:
+        logger.warning(
+            "Could not promote to imgsbackup (serving anyway): pid=%s dest=%s error=%s",
+            os.getpid(),
+            dest_path,
+            exc,
+        )
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return False
+
+
 def find_optimized_webp(folder: str, filename: str) -> str | None:
     basename = os.path.splitext(filename)[0]
     webp_name = f"{basename}.webp"
-    for base in IMGSBACKUP_DIRS:
+    for base in IMGSBACKUP_READ_DIRS:
         candidate = os.path.join(base, folder, webp_name)
         try:
             if os.path.isfile(candidate):
@@ -894,7 +970,7 @@ def main():
     os.environ[ENV_CACHE_CLEANUP_INTERVAL_SECONDS] = str(args.cache_cleanup_interval_seconds)
     os.makedirs(cache_dir, exist_ok=True)
 
-    logger.info("Optimized WebP directories: %s", ", ".join(IMGSBACKUP_DIRS))
+    logger.info("Optimized WebP directories: %s", ", ".join(IMGSBACKUP_READ_DIRS))
     logger.info("Serving images from: %s", imgs_dir)
     logger.info("Cache directory: %s", cache_dir)
     logger.info("Cache max age (hours): %s", args.cache_max_age_hours)
