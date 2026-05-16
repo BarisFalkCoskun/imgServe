@@ -146,8 +146,27 @@ def convert_jxr(src: str, dst: str, fmt: str) -> bool:
 # Formats that browsers/apps can display directly
 WEB_FORMATS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".apng", ".bmp", ".svg"}
 
-# Formats needing conversion
-CONVERT_FORMATS = {".psd", ".tif", ".tiff", ".dng", ".nef", ".arw", ".jxr", ".cr2", ".cr3"}
+# Formats needing conversion (non-RAW)
+CONVERT_FORMATS = {".psd", ".tif", ".tiff", ".jxr"}
+
+# Camera RAW formats — routed to rawpy first for proper demosaicing.
+RAW_EXTS = {".nef", ".arw", ".dng", ".cr2", ".cr3", ".raf", ".rw2", ".orf", ".pef", ".srw"}
+
+# Types we deliberately stream from the source without any conversion.
+PASSTHROUGH_EXTS = {".mp4", ".mov", ".m4v", ".html", ".pdf"}
+
+
+def is_passthrough(ext: str) -> bool:
+    """True if we should stream the source as-is rather than convert it.
+
+    Triggers for: explicit passthrough types, and any extension we have no
+    converter for (defensive default — never block an unknown extension).
+    """
+    e = ext.lower()
+    if e in PASSTHROUGH_EXTS:
+        return True
+    return e not in WEB_FORMATS and e not in CONVERT_FORMATS and e not in RAW_EXTS
+
 
 # Map output format string to file extension
 FORMAT_TO_EXT = {
