@@ -46,11 +46,9 @@ from starlette.background import BackgroundTask
 
 from converter import (
     FORMAT_TO_EXT,
-    PASSTHROUGH_EXTS,
     convert_image,
     get_content_type,
     is_passthrough,
-    needs_conversion,
 )
 
 DEFAULT_IMGS_BASE = "/mnt/storagebox/imgs"
@@ -534,6 +532,10 @@ def main():
     os.environ[ENV_CONVERSION_SLOTS] = str(args.conversion_slots)
     os.environ[ENV_CONVERSION_SLOT_TIMEOUT_SECONDS] = str(args.conversion_slot_timeout_seconds)
     os.makedirs(state_dir, exist_ok=True)
+
+    # Read lookups must reflect the runtime imgsbackup target, not the module default.
+    global IMGSBACKUP_READ_DIRS
+    IMGSBACKUP_READ_DIRS = [imgsbackup_dir]
 
     logger.info("Optimized WebP read dirs: %s", ", ".join(IMGSBACKUP_READ_DIRS))
     logger.info("Source images: %s", imgs_dir)
