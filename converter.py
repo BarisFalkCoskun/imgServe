@@ -34,12 +34,10 @@ def has_transparency(img: Image.Image) -> bool:
 
 
 def choose_output_format(img: Image.Image, requested_format: str | None) -> str:
-    """Choose output format. Respects request, but defaults to PNG if transparent."""
+    """Choose output format. Respects request; defaults to WebP."""
     if requested_format:
         return requested_format.lower()
-    if has_transparency(img):
-        return "png"
-    return "png"  # Default to PNG for lossless quality
+    return "webp"
 
 
 def convert_with_pillow(src: str, dst: str, fmt: str) -> bool:

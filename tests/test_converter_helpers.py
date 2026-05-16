@@ -1,6 +1,7 @@
 import pytest
+from PIL import Image
 
-from converter import get_content_type, PASSTHROUGH_EXTS, RAW_EXTS, is_passthrough
+from converter import get_content_type, PASSTHROUGH_EXTS, RAW_EXTS, is_passthrough, choose_output_format
 
 
 @pytest.mark.parametrize("ext,expected", [
@@ -46,3 +47,14 @@ def test_raw_constants():
 ])
 def test_is_passthrough(ext, expected):
     assert is_passthrough(ext) is expected
+
+
+def test_choose_output_format_defaults_to_webp_for_opaque():
+    img = Image.new("RGB", (4, 4), (10, 20, 30))
+    assert choose_output_format(img, None) == "webp"
+
+
+def test_choose_output_format_respects_request():
+    img = Image.new("RGB", (4, 4), (10, 20, 30))
+    assert choose_output_format(img, "PNG") == "png"
+    assert choose_output_format(img, "jpg") == "jpg"
