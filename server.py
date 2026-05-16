@@ -495,8 +495,8 @@ def _cache_lock(lock_path: str):
 
 
 @contextmanager
-def _conversion_slot(cache_dir: str, slot_count: int, timeout_seconds: int):
-    slots_dir = os.path.join(cache_dir, CACHE_CONVERSION_SLOTS_DIR_NAME)
+def _conversion_slot(state_dir: str, slot_count: int, timeout_seconds: int):
+    slots_dir = os.path.join(state_dir, CACHE_CONVERSION_SLOTS_DIR_NAME)
     os.makedirs(slots_dir, exist_ok=True)
 
     started_at = time.monotonic()
@@ -700,6 +700,9 @@ def create_app() -> FastAPI:
         ENV_CACHE_CLEANUP_INTERVAL_SECONDS,
         DEFAULT_CACHE_CLEANUP_INTERVAL_SECONDS,
     )
+    app.state.imgsbackup_dir = _configured_path(ENV_IMGSBACKUP_PRIMARY, DEFAULT_IMGSBACKUP_PRIMARY)
+    app.state.state_dir = _configured_path(ENV_STATE_DIR, DEFAULT_STATE_DIR)
+    os.makedirs(app.state.state_dir, exist_ok=True)
 
     @app.get("/health")
     def health(request: Request):
@@ -818,7 +821,7 @@ def create_app() -> FastAPI:
                 file_lock_wait_seconds,
             )
             with _conversion_slot(
-                request.app.state.cache_dir,
+                request.app.state.state_dir,
                 slot_count=request.app.state.conversion_slots,
                 timeout_seconds=request.app.state.conversion_slot_timeout_seconds,
             ) as (slot_index, slot_wait_seconds):
