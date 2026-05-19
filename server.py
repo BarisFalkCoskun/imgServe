@@ -2,9 +2,9 @@
 """
 imgServe — Internal image server with write-through conversion.
 
-Serves canonical WebP from /mnt/imgsbackup/imgs3/ when available. On miss,
+Serves canonical WebP from /mnt/storagebox/thumbnails/ when available. On miss,
 falls back to /mnt/storagebox/imgs/, converts the source to WebP in /tmp,
-streams the result, and promotes the WebP into /mnt/imgsbackup/imgs3/ via
+streams the result, and promotes the WebP into /mnt/storagebox/thumbnails/ via
 atomic rename so future requests skip conversion entirely.
 
 Non-image types (.mp4, .mov, .m4v, .html, .pdf, plus any unrecognized
@@ -19,7 +19,7 @@ Binds to 127.0.0.1 only — not accessible from the internet.
 Usage:
   python3 server.py
   python3 server.py --port 8100
-  python3 server.py --imgsbackup-dir /mnt/imgsbackup/imgs3
+  python3 server.py --thumbnails-dir /mnt/storagebox/thumbnails
 
 Request examples:
   GET /imgs/fillop/48e04f71...d956b4.jpg              → serves optimized WebP
@@ -52,7 +52,7 @@ from converter import (
 )
 
 DEFAULT_IMGS_BASE = "/mnt/storagebox/imgs"
-DEFAULT_IMGSBACKUP_PRIMARY = "/mnt/imgsbackup/imgs3"
+DEFAULT_THUMBNAILS_DIR = "/mnt/storagebox/thumbnails"
 DEFAULT_STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
 DEFAULT_HEALTH_MIN_FREE_BYTES = 1 * 1024 * 1024 * 1024
 DEFAULT_CONVERSION_SLOTS = 1
@@ -62,7 +62,9 @@ ENV_IMGS_DIR = "IMGSERVE_IMGS_DIR"
 ENV_HEALTH_MIN_FREE_BYTES = "IMGSERVE_HEALTH_MIN_FREE_BYTES"
 ENV_CONVERSION_SLOTS = "IMGSERVE_CONVERSION_SLOTS"
 ENV_CONVERSION_SLOT_TIMEOUT_SECONDS = "IMGSERVE_CONVERSION_SLOT_TIMEOUT_SECONDS"
-ENV_IMGSBACKUP_PRIMARY = "IMGSERVE_IMGSBACKUP_DIR"
+ENV_THUMBNAILS_DIR = "IMGSERVE_THUMBNAILS_DIR"
+ENV_LEGACY_IMGSBACKUP_DIR = "IMGSERVE_IMGSBACKUP_DIR"
+ENV_IMGSBACKUP_PRIMARY = ENV_LEGACY_IMGSBACKUP_DIR
 ENV_STATE_DIR = "IMGSERVE_STATE_DIR"
 CACHE_CONVERSION_SLOTS_DIR_NAME = ".conversion-slots"
 IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
@@ -77,6 +79,23 @@ logger = logging.getLogger("imgserve")
 
 def _configured_path(env_name: str, default: str) -> str:
     return os.path.abspath(os.environ.get(env_name, default))
+
+
+def _configured_thumbnails_dir() -> str:
+    raw = os.environ.get(ENV_THUMBNAILS_DIR)
+    if raw is not None:
+        return os.path.abspath(raw)
+
+    legacy = os.environ.get(ENV_LEGACY_IMGSBACKUP_DIR)
+    if legacy is not None:
+        logger.warning(
+            "%s is deprecated; use %s instead",
+            ENV_LEGACY_IMGSBACKUP_DIR,
+            ENV_THUMBNAILS_DIR,
+        )
+        return os.path.abspath(legacy)
+
+    return os.path.abspath(DEFAULT_THUMBNAILS_DIR)
 
 
 def _configured_nonnegative_int(env_name: str, default: int) -> int:
@@ -161,25 +180,25 @@ def _check_readable_dir(path: str) -> dict[str, object]:
     return status
 
 
-def _check_optimized_webp_dirs(imgsbackup_read_dirs: list[str]) -> dict[str, object]:
-    checks = [_check_readable_dir(path) for path in imgsbackup_read_dirs]
+def _check_optimized_webp_dirs(thumbnail_read_dirs: list[str]) -> dict[str, object]:
+    checks = [_check_readable_dir(path) for path in thumbnail_read_dirs]
     return {
         "ok": any(bool(check.get("ok")) for check in checks),
         "paths": checks,
     }
 
 
-def _check_imgsbackup_write(imgsbackup_dir: str, min_free_bytes: int) -> dict[str, object]:
-    status: dict[str, object] = {"path": imgsbackup_dir}
+def _check_thumbnails_write(thumbnails_dir: str, min_free_bytes: int) -> dict[str, object]:
+    status: dict[str, object] = {"path": thumbnails_dir}
     try:
-        if not os.path.isdir(imgsbackup_dir):
-            raise FileNotFoundError(f"{imgsbackup_dir} is not a directory")
-        if not os.access(imgsbackup_dir, os.W_OK | os.X_OK):
-            raise PermissionError(f"{imgsbackup_dir} is not writable")
-        with tempfile.NamedTemporaryFile(dir=imgsbackup_dir, prefix=".health-", delete=True) as tmp:
+        if not os.path.isdir(thumbnails_dir):
+            raise FileNotFoundError(f"{thumbnails_dir} is not a directory")
+        if not os.access(thumbnails_dir, os.W_OK | os.X_OK):
+            raise PermissionError(f"{thumbnails_dir} is not writable")
+        with tempfile.NamedTemporaryFile(dir=thumbnails_dir, prefix=".health-", delete=True) as tmp:
             tmp.write(b"ok")
             tmp.flush()
-        usage = shutil.disk_usage(imgsbackup_dir)
+        usage = shutil.disk_usage(thumbnails_dir)
     except Exception as exc:
         status["ok"] = False
         status["error"] = str(exc)
@@ -200,15 +219,15 @@ def _check_imgsbackup_write(imgsbackup_dir: str, min_free_bytes: int) -> dict[st
 
 def _health_payload(
     imgs_dir: str,
-    imgsbackup_dir: str,
-    imgsbackup_read_dirs: list[str],
+    thumbnails_dir: str,
+    thumbnail_read_dirs: list[str],
     health_min_free_bytes: int,
 ) -> tuple[dict[str, object], int]:
-    optimized_webp = _check_optimized_webp_dirs(imgsbackup_read_dirs)
+    optimized_webp = _check_optimized_webp_dirs(thumbnail_read_dirs)
     fallback_source = _check_readable_dir(imgs_dir)
-    imgsbackup = _check_imgsbackup_write(imgsbackup_dir, health_min_free_bytes)
+    thumbnails = _check_thumbnails_write(thumbnails_dir, health_min_free_bytes)
     source_available = bool(optimized_webp.get("ok")) or bool(fallback_source.get("ok"))
-    healthy = source_available and bool(imgsbackup.get("ok"))
+    healthy = source_available and bool(thumbnails.get("ok"))
 
     return {
         "status": "ok" if healthy else "error",
@@ -216,7 +235,7 @@ def _health_payload(
         "checks": {
             "optimized_webp": optimized_webp,
             "fallback_source": fallback_source,
-            "imgsbackup": imgsbackup,
+            "thumbnails": thumbnails,
         },
     }, (200 if healthy else 503)
 
@@ -275,14 +294,14 @@ def _file_response(path: str, media_type: str, cache_control: str) -> FileRespon
     return FileResponse(path, media_type=media_type, headers={"Cache-Control": cache_control})
 
 
-def promote_to_imgsbackup(local_path: str, imgsbackup_dir: str, folder: str, filename: str) -> bool:
-    """Copy a freshly-converted WebP into imgsbackup atomically.
+def promote_to_thumbnails(local_path: str, thumbnails_dir: str, folder: str, filename: str) -> bool:
+    """Copy a freshly-converted WebP into the thumbnails directory atomically.
 
     Returns True on success, False on any OSError. Failure is logged at WARNING
     but does not raise — the caller still serves the local bytes.
     """
     basename = os.path.splitext(filename)[0]
-    dest_dir = os.path.join(imgsbackup_dir, folder)
+    dest_dir = os.path.join(thumbnails_dir, folder)
     dest_path = os.path.join(dest_dir, f"{basename}.webp")
     tmp_name = f".{basename}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
     tmp_path = os.path.join(dest_dir, tmp_name)
@@ -291,7 +310,7 @@ def promote_to_imgsbackup(local_path: str, imgsbackup_dir: str, folder: str, fil
         shutil.copyfile(local_path, tmp_path)
         os.rename(tmp_path, dest_path)
         logger.info(
-            "Promoted to imgsbackup: pid=%s path=%s bytes=%s",
+            "Promoted to thumbnails: pid=%s path=%s bytes=%s",
             os.getpid(),
             dest_path,
             os.path.getsize(dest_path),
@@ -299,7 +318,7 @@ def promote_to_imgsbackup(local_path: str, imgsbackup_dir: str, folder: str, fil
         return True
     except OSError as exc:
         logger.warning(
-            "Could not promote to imgsbackup (serving anyway): pid=%s dest=%s error=%s",
+            "Could not promote to thumbnails (serving anyway): pid=%s dest=%s error=%s",
             os.getpid(),
             dest_path,
             exc,
@@ -311,6 +330,9 @@ def promote_to_imgsbackup(local_path: str, imgsbackup_dir: str, folder: str, fil
         return False
 
 
+promote_to_imgsbackup = promote_to_thumbnails
+
+
 def _safe_unlink(path: str) -> None:
     try:
         os.unlink(path)
@@ -318,10 +340,10 @@ def _safe_unlink(path: str) -> None:
         pass
 
 
-def find_optimized_webp(folder: str, filename: str, imgsbackup_read_dirs: list[str]) -> str | None:
+def find_optimized_webp(folder: str, filename: str, thumbnail_read_dirs: list[str]) -> str | None:
     basename = os.path.splitext(filename)[0]
     webp_name = f"{basename}.webp"
-    for base in imgsbackup_read_dirs:
+    for base in thumbnail_read_dirs:
         candidate = os.path.join(base, folder, webp_name)
         try:
             if os.path.isfile(candidate):
@@ -346,16 +368,16 @@ def create_app(log_config: bool = True) -> FastAPI:
         ENV_CONVERSION_SLOT_TIMEOUT_SECONDS,
         DEFAULT_CONVERSION_SLOT_TIMEOUT_SECONDS,
     )
-    app.state.imgsbackup_dir = _configured_path(ENV_IMGSBACKUP_PRIMARY, DEFAULT_IMGSBACKUP_PRIMARY)
-    app.state.imgsbackup_read_dirs = [app.state.imgsbackup_dir]
+    app.state.thumbnails_dir = _configured_thumbnails_dir()
+    app.state.thumbnail_read_dirs = [app.state.thumbnails_dir]
     app.state.state_dir = _configured_path(ENV_STATE_DIR, DEFAULT_STATE_DIR)
     os.makedirs(app.state.state_dir, exist_ok=True)
     if log_config:
         logger.info(
-            "App configured: imgs_dir=%s imgsbackup_write=%s imgsbackup_read_dirs=%s state_dir=%s",
+            "App configured: imgs_dir=%s thumbnails_write=%s thumbnail_read_dirs=%s state_dir=%s",
             app.state.imgs_dir,
-            app.state.imgsbackup_dir,
-            ", ".join(app.state.imgsbackup_read_dirs),
+            app.state.thumbnails_dir,
+            ", ".join(app.state.thumbnail_read_dirs),
             app.state.state_dir,
         )
 
@@ -363,8 +385,8 @@ def create_app(log_config: bool = True) -> FastAPI:
     def health(request: Request):
         payload, status_code = _health_payload(
             request.app.state.imgs_dir,
-            request.app.state.imgsbackup_dir,
-            request.app.state.imgsbackup_read_dirs,
+            request.app.state.thumbnails_dir,
+            request.app.state.thumbnail_read_dirs,
             request.app.state.health_min_free_bytes,
         )
         return JSONResponse(payload, status_code=status_code)
@@ -381,7 +403,7 @@ def create_app(log_config: bool = True) -> FastAPI:
 
         # 1. Cached canonical WebP — fast path.
         if format is None or format.lower() == "webp":
-            optimized = find_optimized_webp(folder, filename, request.app.state.imgsbackup_read_dirs)
+            optimized = find_optimized_webp(folder, filename, request.app.state.thumbnail_read_dirs)
             if optimized is not None:
                 logger.debug(
                     "Serving optimized WebP: pid=%s image=%s/%s path=%s",
@@ -451,9 +473,9 @@ def create_app(log_config: bool = True) -> FastAPI:
 
             # 6. Write-back only for canonical WebP. Fail-soft.
             if out_fmt == "webp":
-                promote_to_imgsbackup(
+                promote_to_thumbnails(
                     tmp_out,
-                    request.app.state.imgsbackup_dir,
+                    request.app.state.thumbnails_dir,
                     folder,
                     filename,
                 )
@@ -491,9 +513,15 @@ def main():
         help=f"Source images directory (default: {DEFAULT_IMGS_BASE})",
     )
     parser.add_argument(
+        "--thumbnails-dir",
+        default=None,
+        help=f"Writable canonical WebP store (default: {DEFAULT_THUMBNAILS_DIR})",
+    )
+    parser.add_argument(
         "--imgsbackup-dir",
-        default=DEFAULT_IMGSBACKUP_PRIMARY,
-        help=f"Writable canonical WebP store (default: {DEFAULT_IMGSBACKUP_PRIMARY})",
+        dest="thumbnails_dir",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--state-dir",
@@ -504,7 +532,7 @@ def main():
         "--health-min-free-bytes",
         type=int,
         default=DEFAULT_HEALTH_MIN_FREE_BYTES,
-        help=f"Mark /health unhealthy below this imgsbackup free-space floor (default: {DEFAULT_HEALTH_MIN_FREE_BYTES})",
+        help=f"Mark /health unhealthy below this thumbnails free-space floor (default: {DEFAULT_HEALTH_MIN_FREE_BYTES})",
     )
     parser.add_argument(
         "--conversion-slots",
@@ -535,19 +563,24 @@ def main():
         parser.error("--workers must be > 0")
 
     imgs_dir = os.path.abspath(args.imgs_dir)
-    imgsbackup_dir = os.path.abspath(args.imgsbackup_dir)
+    thumbnails_dir = os.path.abspath(
+        args.thumbnails_dir
+        or os.environ.get(ENV_THUMBNAILS_DIR)
+        or os.environ.get(ENV_LEGACY_IMGSBACKUP_DIR)
+        or DEFAULT_THUMBNAILS_DIR
+    )
     state_dir = os.path.abspath(args.state_dir)
     os.environ[ENV_IMGS_DIR] = imgs_dir
-    os.environ[ENV_IMGSBACKUP_PRIMARY] = imgsbackup_dir
+    os.environ[ENV_THUMBNAILS_DIR] = thumbnails_dir
     os.environ[ENV_STATE_DIR] = state_dir
     os.environ[ENV_HEALTH_MIN_FREE_BYTES] = str(args.health_min_free_bytes)
     os.environ[ENV_CONVERSION_SLOTS] = str(args.conversion_slots)
     os.environ[ENV_CONVERSION_SLOT_TIMEOUT_SECONDS] = str(args.conversion_slot_timeout_seconds)
     os.makedirs(state_dir, exist_ok=True)
 
-    logger.info("Optimized WebP read dirs: %s", imgsbackup_dir)
+    logger.info("Optimized WebP read dirs: %s", thumbnails_dir)
     logger.info("Source images: %s", imgs_dir)
-    logger.info("imgsbackup write target: %s", imgsbackup_dir)
+    logger.info("Thumbnails write target: %s", thumbnails_dir)
     logger.info("State dir (conversion slot locks): %s", state_dir)
     logger.info("Health min free bytes: %s", _format_bytes(args.health_min_free_bytes))
     logger.info("Conversion slots: %s", args.conversion_slots)

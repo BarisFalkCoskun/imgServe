@@ -3,10 +3,10 @@ def test_format_png_does_not_write_back(client, put_source, env_dirs):
     r = client.get(f"/imgs/demo/{src.name}?format=png")
     assert r.status_code == 200
     assert r.headers["content-type"] == "image/png"
-    # No WebP written to imgsbackup
-    assert list((env_dirs["backup"]).rglob("*.webp")) == []
+    # No WebP written to thumbnails
+    assert list((env_dirs["thumbnails"]).rglob("*.webp")) == []
     # And no spurious PNG either
-    assert list((env_dirs["backup"]).rglob("*.png")) == []
+    assert list((env_dirs["thumbnails"]).rglob("*.png")) == []
 
 
 def test_format_jpg_does_not_write_back(client, put_source, env_dirs):
@@ -14,7 +14,7 @@ def test_format_jpg_does_not_write_back(client, put_source, env_dirs):
     r = client.get(f"/imgs/demo/{src.name}?format=jpg")
     assert r.status_code == 200
     assert r.headers["content-type"] == "image/jpeg"
-    assert list((env_dirs["backup"]).rglob("*")) == []
+    assert list((env_dirs["thumbnails"]).rglob("*")) == []
 
 
 def test_unsupported_format_400(client, put_source):

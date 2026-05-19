@@ -1,6 +1,6 @@
 # imgServe
 
-Internal image server with write-through conversion. Serves canonical WebP from `/mnt/imgsbackup/imgs3/` when available; on miss, converts the source from `/mnt/storagebox/imgs/` to WebP in `/tmp`, streams it, and atomically promotes the result back into `/mnt/imgsbackup/imgs3/` so future requests skip conversion.
+Internal image server with write-through conversion. Serves canonical WebP from `/mnt/storagebox/thumbnails/` when available; on miss, converts the source from `/mnt/storagebox/imgs/` to WebP in `/tmp`, streams it, and atomically promotes the result back into `/mnt/storagebox/thumbnails/` so future requests skip conversion.
 
 Camera RAW (`.nef/.arw/.dng/.cr2/.cr3/...`) is decoded via libraw (`rawpy`) for correct demosaicing — no channel-separation artifacts. Non-image types (`.mp4/.mov/.m4v/.html/.pdf` and any unrecognized extension) stream through with the right `Content-Type`.
 
@@ -70,7 +70,7 @@ The examples below assume `uv run`.
 
 ## Running the server
 
-Defaults bind `127.0.0.1:8100` and use `/mnt/storagebox/imgs/` + `/mnt/imgsbackup/imgs3/`:
+Defaults bind `127.0.0.1:8100` and use `/mnt/storagebox/imgs/` + `/mnt/storagebox/thumbnails/`:
 
 ```bash
 uv run python server.py
@@ -79,12 +79,12 @@ uv run python server.py
 Local dev with temp directories:
 
 ```bash
-mkdir -p /tmp/imgserve/imgs/demo /tmp/imgserve/backup /tmp/imgserve/state
+mkdir -p /tmp/imgserve/imgs/demo /tmp/imgserve/thumbnails /tmp/imgserve/state
 cp some-image.psd /tmp/imgserve/imgs/demo/
 
 uv run python server.py \
   --imgs-dir /tmp/imgserve/imgs \
-  --imgsbackup-dir /tmp/imgserve/backup \
+  --thumbnails-dir /tmp/imgserve/thumbnails \
   --state-dir /tmp/imgserve/state \
   --workers 1
 ```
@@ -96,7 +96,7 @@ curl -I http://127.0.0.1:8100/imgs/demo/some-image.psd
 curl    http://127.0.0.1:8100/health
 ```
 
-The first request to a source converts + writes back to `--imgsbackup-dir`. The second request reads straight from there with no conversion.
+The first request to a source converts + writes back to `--thumbnails-dir`. The second request reads straight from there with no conversion.
 
 ### CLI flags
 
@@ -105,7 +105,7 @@ The first request to a source converts + writes back to `--imgsbackup-dir`. The 
 | `--host` | `127.0.0.1` | Bind address |
 | `--port` | `8100` | Port |
 | `--imgs-dir` | `/mnt/storagebox/imgs` | Source images (read-only) |
-| `--imgsbackup-dir` | `/mnt/imgsbackup/imgs3` | Canonical WebP store (read + write) |
+| `--thumbnails-dir` | `/mnt/storagebox/thumbnails` | Canonical WebP store (read + write) |
 | `--state-dir` | `./state` | Holds conversion-slot fcntl locks |
 | `--health-min-free-bytes` | `1073741824` (1 GiB) | Threshold below which `/health` reports unhealthy |
 | `--conversion-slots` | `1` | Max concurrent conversions across all workers on this host |
@@ -129,8 +129,8 @@ The `ffmpeg` fixtures (`clip.mp4/.mov/.m4v`) are only generated if `ffmpeg` is o
 
 | Endpoint | Behavior |
 |---|---|
-| `GET /imgs/{folder}/{filename}` | Serves WebP if cached in imgsbackup, else converts the source and writes back. `?format=png` and `?format=jpg` re-convert every time (not cached). |
-| `GET /health` | 200 with check details on success; 503 if either source or imgsbackup write-probe fails. |
+| `GET /imgs/{folder}/{filename}` | Serves WebP if cached in thumbnails, else converts the source and writes back. `?format=png` and `?format=jpg` re-convert every time (not cached). |
+| `GET /health` | 200 with check details on success; 503 if either source or thumbnails write-probe fails. |
 
 ## Adding more file extensions
 

@@ -13,8 +13,8 @@ def test_passthrough_documents(client, put_source, fixture, ext, expected_ct, en
     assert r.status_code == 200
     assert r.headers["content-type"] == expected_ct
     assert r.content == src.read_bytes()
-    # nothing written to imgsbackup
-    assert list((env_dirs["backup"]).rglob("*.webp")) == []
+    # nothing written to thumbnails
+    assert list((env_dirs["thumbnails"]).rglob("*.webp")) == []
 
 
 @pytest.mark.parametrize("fixture,expected_ct", [
@@ -31,4 +31,4 @@ def test_passthrough_video(client, put_source, fixture, expected_ct, env_dirs):
     assert r.status_code == 200
     assert r.headers["content-type"] == expected_ct
     assert r.content == src.read_bytes()
-    assert list((env_dirs["backup"]).rglob("*.webp")) == []
+    assert list((env_dirs["thumbnails"]).rglob("*.webp")) == []

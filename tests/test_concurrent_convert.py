@@ -17,7 +17,7 @@ def test_concurrent_requests_for_same_source(client, put_source, env_dirs):
     assert sizes and len(sizes) == 1, f"divergent payload sizes: {sizes}"
     assert cts == {"image/webp"}
 
-    # Exactly one canonical WebP in imgsbackup, no stray .tmp files.
-    backup_demo = env_dirs["backup"] / "demo"
-    files = sorted(p.name for p in backup_demo.iterdir())
+    # Exactly one canonical WebP in thumbnails, no stray .tmp files.
+    thumbnails_demo = env_dirs["thumbnails"] / "demo"
+    files = sorted(p.name for p in thumbnails_demo.iterdir())
     assert files == ["solid.webp"], files

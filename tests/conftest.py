@@ -1,6 +1,6 @@
 """Shared pytest fixtures.
 
-Builds an isolated FastAPI app per test, pointing imgs/imgsbackup/state dirs
+Builds an isolated FastAPI app per test, pointing imgs/thumbnails/state dirs
 at tmp_path so tests never touch real mounts.
 """
 from __future__ import annotations
@@ -30,17 +30,17 @@ def _put(src_fixture: str, dst_dir: Path, dst_name: str | None = None) -> Path:
 @pytest.fixture
 def env_dirs(tmp_path):
     imgs = tmp_path / "imgs"
-    backup = tmp_path / "imgsbackup"
+    thumbnails = tmp_path / "thumbnails"
     state = tmp_path / "state"
-    for d in (imgs, backup, state):
+    for d in (imgs, thumbnails, state):
         d.mkdir(parents=True, exist_ok=True)
-    return {"imgs": imgs, "backup": backup, "state": state}
+    return {"imgs": imgs, "thumbnails": thumbnails, "state": state}
 
 
 @pytest.fixture
 def app(env_dirs, monkeypatch):
     monkeypatch.setenv(server.ENV_IMGS_DIR, str(env_dirs["imgs"]))
-    monkeypatch.setenv(server.ENV_IMGSBACKUP_PRIMARY, str(env_dirs["backup"]))
+    monkeypatch.setenv(server.ENV_THUMBNAILS_DIR, str(env_dirs["thumbnails"]))
     monkeypatch.setenv(server.ENV_STATE_DIR, str(env_dirs["state"]))
     monkeypatch.setenv(server.ENV_CONVERSION_SLOTS, "2")
     monkeypatch.setenv(server.ENV_CONVERSION_SLOT_TIMEOUT_SECONDS, "5")
@@ -63,8 +63,8 @@ def put_source(env_dirs):
 
 @pytest.fixture
 def put_backup(env_dirs):
-    """Pre-place a WebP into imgsbackup/<folder>/<name>.webp."""
+    """Pre-place a WebP into thumbnails/<folder>/<name>.webp."""
     def _put_backup(fixture_name: str, folder: str = "demo", as_name: str | None = None) -> Path:
-        folder_path = env_dirs["backup"] / folder
+        folder_path = env_dirs["thumbnails"] / folder
         return _put(fixture_name, folder_path, as_name)
     return _put_backup
