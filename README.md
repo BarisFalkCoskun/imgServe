@@ -125,12 +125,13 @@ rsync -a --ignore-existing /local-ssd/thumbnails/salling/ /mnt/storagebox/thumbn
 Progress and worker state are written under `state/preconvert/` by default:
 
 ```bash
+cat state/preconvert/scan.json
 cat state/preconvert/summary.json
 ls state/preconvert/workers/
 tail -f state/preconvert/events.jsonl
 ```
 
-Use `--dry-run` to see how many files would be queued without converting. Existing `{basename}.webp` files are skipped unless `--force` is passed. Use `--no-prefetch` to disable local source prefetching and convert directly from the mounted source paths.
+Use `--dry-run` to see how many files would be queued without converting. Existing `{basename}.webp` files are skipped unless `--force` is passed. Use `--no-prefetch` to disable local source prefetching and convert directly from the mounted source paths. During a large Storage Box scan, `scan.json` and `events.jsonl` are updated before conversion starts; tune this with `--scan-log-interval` and `--scan-log-seconds`.
 
 ### CLI flags
 

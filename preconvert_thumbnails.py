@@ -38,6 +38,8 @@ DEFAULT_FOLDER = "salling"
 DEFAULT_STATE_DIR = Path(__file__).resolve().parent / "state" / "preconvert"
 DEFAULT_TMP_DIR = tempfile.gettempdir()
 DEFAULT_WORKERS = max(1, min(4, (os.cpu_count() or 2)))
+DEFAULT_SCAN_LOG_INTERVAL = 1000
+DEFAULT_SCAN_LOG_SECONDS = 10.0
 EVENT_LOG_NAME = "events.jsonl"
 
 logger = logging.getLogger("imgserve.preconvert")
@@ -90,8 +92,10 @@ def lock_path_for(state_dir: Path, dest_path: Path) -> Path:
     return state_dir / "locks" / f"{digest}.lock"
 
 
-def iter_source_files(source_dir: Path) -> list[Path]:
-    return sorted(path for path in source_dir.iterdir() if path.is_file() and not path.name.startswith("."))
+def iter_source_files(source_dir: Path):
+    for path in source_dir.iterdir():
+        if path.is_file() and not path.name.startswith("."):
+            yield path
 
 
 def build_tasks(
@@ -102,28 +106,81 @@ def build_tasks(
     force: bool,
     tmp_dir: Path,
     limit: int | None = None,
-) -> tuple[list[ConversionTask], dict[str, int]]:
+    scan_log_interval: int = DEFAULT_SCAN_LOG_INTERVAL,
+    scan_log_seconds: float = DEFAULT_SCAN_LOG_SECONDS,
+) -> tuple[list[ConversionTask], dict[str, Any]]:
     stats = {
         "seen": 0,
         "queued": 0,
         "skipped_existing": 0,
         "skipped_passthrough": 0,
         "skipped_collision": 0,
+        "dest_exists_checks": 0,
+        "dest_exists_elapsed_seconds": 0.0,
     }
     tasks: list[ConversionTask] = []
     queued_stems: set[str] = set()
+    scan_started = time.monotonic()
+    last_log_at = scan_started
+    last_logged_seen = 0
+
+    def emit_scan_progress(reason: str, source_path: Path | None = None, force_log: bool = False) -> None:
+        nonlocal last_log_at, last_logged_seen
+        now = time.monotonic()
+        enough_files = stats["seen"] - last_logged_seen >= scan_log_interval
+        enough_time = now - last_log_at >= scan_log_seconds
+        if not force_log and not enough_files and not enough_time:
+            return
+
+        payload = {
+            "phase": "scanning",
+            "reason": reason,
+            "updated_at": utc_now(),
+            "source_dir": str(source_dir),
+            "thumbnails_dir": str(thumbnails_dir),
+            "folder": folder,
+            "elapsed_seconds": round(now - scan_started, 3),
+            "stats": dict(stats),
+            "last_source_path": str(source_path) if source_path is not None else None,
+        }
+        write_json_atomic(state_dir / "scan.json", payload)
+        append_event_to(state_dir / EVENT_LOG_NAME, {"event": "scan_progress", **payload})
+        logger.info(
+            "Scan progress: seen=%s queued=%s skipped_existing=%s skipped_passthrough=%s dest_exists_checks=%s dest_exists_seconds=%.3f last=%s",
+            stats["seen"],
+            stats["queued"],
+            stats["skipped_existing"],
+            stats["skipped_passthrough"],
+            stats["dest_exists_checks"],
+            stats["dest_exists_elapsed_seconds"],
+            source_path,
+        )
+        last_log_at = now
+        last_logged_seen = stats["seen"]
+
+    logger.info("Scan started: source_dir=%s thumbnails_dir=%s folder=%s", source_dir, thumbnails_dir, folder)
+    emit_scan_progress("start", force_log=True)
 
     for source_path in iter_source_files(source_dir):
         stats["seen"] += 1
         ext = source_path.suffix.lower()
         if is_passthrough(ext):
             stats["skipped_passthrough"] += 1
+            emit_scan_progress("passthrough", source_path)
             continue
 
         stem = source_path.stem
         dest_path = thumbnail_path(thumbnails_dir, folder, source_path.name)
-        if dest_path.exists() and not force:
+        exists_started = time.monotonic()
+        dest_exists = dest_path.exists()
+        stats["dest_exists_checks"] += 1
+        stats["dest_exists_elapsed_seconds"] = round(
+            stats["dest_exists_elapsed_seconds"] + time.monotonic() - exists_started,
+            3,
+        )
+        if dest_exists and not force:
             stats["skipped_existing"] += 1
+            emit_scan_progress("existing", source_path)
             continue
 
         if stem in queued_stems and not force:
@@ -133,6 +190,7 @@ def build_tasks(
                 source_path,
                 dest_path,
             )
+            emit_scan_progress("collision", source_path)
             continue
 
         queued_stems.add(stem)
@@ -149,10 +207,12 @@ def build_tasks(
             )
         )
         stats["queued"] += 1
+        emit_scan_progress("queued", source_path)
 
         if limit is not None and len(tasks) >= limit:
             break
 
+    emit_scan_progress("finish", force_log=True)
     return tasks, stats
 
 
@@ -567,6 +627,10 @@ def parse_args() -> argparse.Namespace:
                         help="Max source files in the local prefetch/conversion pipeline (default: max(workers * 2, workers + prefetch_workers))")
     parser.add_argument("--no-prefetch", action="store_true",
                         help="Convert directly from source paths instead of first copying sources to local SSD")
+    parser.add_argument("--scan-log-interval", type=int, default=DEFAULT_SCAN_LOG_INTERVAL,
+                        help=f"Log scan progress after this many source files (default: {DEFAULT_SCAN_LOG_INTERVAL})")
+    parser.add_argument("--scan-log-seconds", type=float, default=DEFAULT_SCAN_LOG_SECONDS,
+                        help=f"Log scan progress after this many seconds during scanning (default: {DEFAULT_SCAN_LOG_SECONDS:g})")
     parser.add_argument("--limit", type=int, default=None,
                         help="Only queue this many convertible missing files")
     parser.add_argument("--force", action="store_true",
@@ -582,6 +646,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--prefetch-workers must be > 0")
     if args.prefetch_buffer is not None and args.prefetch_buffer <= 0:
         parser.error("--prefetch-buffer must be > 0")
+    if args.scan_log_interval <= 0:
+        parser.error("--scan-log-interval must be > 0")
+    if args.scan_log_seconds <= 0:
+        parser.error("--scan-log-seconds must be > 0")
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be > 0")
     return args
@@ -630,6 +698,8 @@ def main() -> int:
         force=args.force,
         tmp_dir=tmp_dir,
         limit=args.limit,
+        scan_log_interval=args.scan_log_interval,
+        scan_log_seconds=args.scan_log_seconds,
     )
 
     summary: dict[str, Any] = {

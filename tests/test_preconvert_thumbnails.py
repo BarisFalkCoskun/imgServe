@@ -24,13 +24,25 @@ def test_build_tasks_skips_existing_and_passthrough(tmp_path):
         tmp_dir=tmp_path,
     )
 
-    assert stats == {
+    assert {
+        key: stats[key]
+        for key in (
+            "seen",
+            "queued",
+            "skipped_existing",
+            "skipped_passthrough",
+            "skipped_collision",
+            "dest_exists_checks",
+        )
+    } == {
         "seen": 3,
         "queued": 1,
         "skipped_existing": 1,
         "skipped_passthrough": 1,
         "skipped_collision": 0,
+        "dest_exists_checks": 2,
     }
+    assert stats["dest_exists_elapsed_seconds"] >= 0
     assert [Path(task.source_path).name for task in tasks] == ["image.jpg"]
     assert Path(tasks[0].dest_path) == thumbnails_dir / "salling" / "image.webp"
 
