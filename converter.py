@@ -3,11 +3,12 @@ Image conversion module.
 
 Converts non-web-friendly image formats to PNG (preserves transparency)
 or JPG/WebP on request. Uses multiple backends as fallbacks:
-  1. Pillow (most formats including PSD first composite layer)
-  2. ImageMagick (broader format support)
-  3. ffmpeg (handles TIFFs that crash ImageMagick)
-  4. tiffcp + Pillow (for TIFFs with broken metadata)
-  5. JxrDecApp (JPEG XR)
+  1. rawpy/libraw for camera RAW
+  2. ImageMagick first for PSD flattened composites
+  3. Pillow for standard image formats
+  4. ffmpeg (handles TIFFs that crash ImageMagick)
+  5. tiffcp + Pillow (for TIFFs with broken metadata)
+  6. JxrDecApp (JPEG XR)
 """
 
 import os
@@ -280,14 +281,23 @@ def convert_image(src_path: str, dst_path: str, fmt: str = "png") -> bool:
             return True
         return False
 
-    # Try backends in order
-    backends = [
-        ("rawpy", convert_with_rawpy),       # short-circuits False for non-RAW
-        ("Pillow", convert_with_pillow),
-        ("ImageMagick", convert_with_magick),
-        ("ffmpeg", convert_with_ffmpeg),
-        ("tiffcp", convert_with_tiffcp),
-    ]
+    # Try backends in order. Complex PSDs can expose per-layer/channel data
+    # through Pillow; ImageMagick's [0] scene gives the flattened composite.
+    if ext == ".psd":
+        backends = [
+            ("ImageMagick", convert_with_magick),
+            ("Pillow", convert_with_pillow),
+            ("ffmpeg", convert_with_ffmpeg),
+            ("tiffcp", convert_with_tiffcp),
+        ]
+    else:
+        backends = [
+            ("rawpy", convert_with_rawpy),       # short-circuits False for non-RAW
+            ("Pillow", convert_with_pillow),
+            ("ImageMagick", convert_with_magick),
+            ("ffmpeg", convert_with_ffmpeg),
+            ("tiffcp", convert_with_tiffcp),
+        ]
 
     for name, backend in backends:
         if backend(src_path, dst_path, fmt):

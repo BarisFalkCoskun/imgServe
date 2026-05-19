@@ -1,6 +1,7 @@
 import pytest
 from PIL import Image
 
+import converter
 from converter import get_content_type, PASSTHROUGH_EXTS, RAW_EXTS, is_passthrough, choose_output_format
 
 
@@ -69,6 +70,28 @@ def test_convert_image_handles_jpg_to_webp(tmp_path):
     dst = tmp_path / "out.webp"
     assert convert_image(str(src), str(dst), "webp") is True
     assert Image.open(dst).format == "WEBP"
+
+
+def test_convert_image_prefers_imagemagick_for_psd(tmp_path, monkeypatch):
+    calls = []
+    src = tmp_path / "source.psd"
+    dst = tmp_path / "out.webp"
+    src.write_bytes(b"psd")
+
+    def fake_magick(_src, _dst, _fmt):
+        calls.append("ImageMagick")
+        dst.write_bytes(b"webp")
+        return True
+
+    def fake_pillow(_src, _dst, _fmt):
+        calls.append("Pillow")
+        return True
+
+    monkeypatch.setattr(converter, "convert_with_magick", fake_magick)
+    monkeypatch.setattr(converter, "convert_with_pillow", fake_pillow)
+
+    assert converter.convert_image(str(src), str(dst), "webp") is True
+    assert calls == ["ImageMagick"]
 
 
 def test_pillow_converts_png_without_icc(tmp_path):
