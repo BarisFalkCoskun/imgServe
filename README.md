@@ -98,6 +98,40 @@ curl    http://127.0.0.1:8100/health
 
 The first request to a source converts + writes back to `--thumbnails-dir`. The second request reads straight from there with no conversion.
 
+## Preconverting thumbnails
+
+For a large one-time backfill, run the preconverter on a stronger machine against the same mounted storage. It uses the same conversion rules as the server, never modifies source files, skips passthrough types such as videos/PDF/HTML, and writes canonical WebP files into the thumbnails tree.
+
+By default the preconverter pipelines the work: a small thread pool copies upcoming source files from Storage Box into a bounded local SSD prefetch directory while separate process workers convert already-prefetched files. This keeps the CPUs busy without leaving a large permanent cache on the server; prefetched source copies are deleted after their conversion task finishes.
+
+```bash
+uv run python preconvert_thumbnails.py \
+  --source-root /mnt/storagebox/imgs \
+  --folder salling \
+  --thumbnails-dir /local-ssd/thumbnails \
+  --tmp-dir /local-ssd/tmp \
+  --prefetch-dir /local-ssd/prefetch \
+  --workers 8 \
+  --prefetch-workers 4 \
+  --prefetch-buffer 24
+```
+
+Then sync completed WebP files back to the shared thumbnails folder:
+
+```bash
+rsync -a --ignore-existing /local-ssd/thumbnails/salling/ /mnt/storagebox/thumbnails/salling/
+```
+
+Progress and worker state are written under `state/preconvert/` by default:
+
+```bash
+cat state/preconvert/summary.json
+ls state/preconvert/workers/
+tail -f state/preconvert/events.jsonl
+```
+
+Use `--dry-run` to see how many files would be queued without converting. Existing `{basename}.webp` files are skipped unless `--force` is passed. Use `--no-prefetch` to disable local source prefetching and convert directly from the mounted source paths.
+
 ### CLI flags
 
 | Flag | Default | Purpose |
