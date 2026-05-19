@@ -671,3 +671,5 @@ tests/fixtures/*.m4v
 tests/fixtures/*.html
 tests/fixtures/*.pdf
 tests/fixtures/*.dng
+.codex-out/*
+samples/*

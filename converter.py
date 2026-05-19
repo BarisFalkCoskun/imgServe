@@ -290,6 +290,7 @@ def convert_image(src_path: str, dst_path: str, fmt: str = "png") -> bool:
             ("ffmpeg", convert_with_ffmpeg),
             ("tiffcp", convert_with_tiffcp),
         ]
+        logger.info("PSD conversion will prefer ImageMagick flattened composite: %s", src_path)
     else:
         backends = [
             ("rawpy", convert_with_rawpy),       # short-circuits False for non-RAW
@@ -303,6 +304,12 @@ def convert_image(src_path: str, dst_path: str, fmt: str = "png") -> bool:
         if backend(src_path, dst_path, fmt):
             logger.info(f"Converted {src_path} with {name}")
             return True
+        if ext == ".psd" and name == "ImageMagick":
+            logger.warning(
+                "PSD ImageMagick conversion failed; falling back to other backends "
+                "may expose layer/channel artifacts: %s",
+                src_path,
+            )
 
     logger.error(f"All backends failed for {src_path}")
     return False
