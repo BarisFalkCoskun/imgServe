@@ -15,11 +15,49 @@ import os
 import subprocess
 import tempfile
 import logging
+import contextvars
 from PIL import Image
 
 logger = logging.getLogger("imgserve.converter")
 
 Image.MAX_IMAGE_PIXELS = None
+
+_backend_failures_var: contextvars.ContextVar[list[dict[str, str]] | None] = contextvars.ContextVar(
+    "backend_failures",
+    default=None,
+)
+
+
+def _short_detail(value: object, limit: int = 500) -> str:
+    detail = str(value).replace("\n", " ").replace("\r", " ").strip()
+    if len(detail) > limit:
+        return detail[:limit] + "..."
+    return detail
+
+
+def _record_backend_failure(backend: str, src: str, detail: object) -> None:
+    formatted = _short_detail(detail)
+    failures = _backend_failures_var.get()
+    if failures is not None:
+        failures.append({"backend": backend, "detail": formatted})
+    logger.debug("%s failed for %s: %s", backend, src, formatted)
+
+
+def _file_diagnostics(path: str) -> dict[str, object]:
+    diagnostics: dict[str, object] = {"path": path}
+    try:
+        stat = os.stat(path)
+        diagnostics["size"] = stat.st_size
+    except OSError as exc:
+        diagnostics["stat_error"] = repr(exc)
+        return diagnostics
+
+    try:
+        with open(path, "rb") as handle:
+            diagnostics["header_hex"] = handle.read(32).hex()
+    except OSError as exc:
+        diagnostics["read_error"] = repr(exc)
+    return diagnostics
 
 
 def has_transparency(img: Image.Image) -> bool:
@@ -75,7 +113,7 @@ def convert_with_rawpy(src: str, dst: str, fmt: str) -> bool:
         img.save(dst, **save_kwargs)
         return True
     except Exception as exc:
-        logger.debug("rawpy failed for %s: %s", src, exc)
+        _record_backend_failure("rawpy", src, f"{type(exc).__name__}: {exc}")
         return False
 
 
@@ -126,7 +164,7 @@ def convert_with_pillow(src: str, dst: str, fmt: str) -> bool:
             img.save(dst, **save_kwargs)
             return True
     except Exception as e:
-        logger.debug(f"Pillow failed for {src}: {e}")
+        _record_backend_failure("Pillow", src, f"{type(e).__name__}: {e}")
         return False
 
 
@@ -138,10 +176,11 @@ def convert_with_magick(src: str, dst: str, fmt: str) -> bool:
         r = subprocess.run(cmd, capture_output=True, timeout=60)
         if r.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0:
             return True
-        logger.debug(f"ImageMagick failed for {src}: {r.stderr.decode(errors='replace')[:200]}")
+        stderr = r.stderr.decode(errors="replace")
+        _record_backend_failure("ImageMagick", src, f"returncode={r.returncode} stderr={stderr}")
         return False
     except Exception as e:
-        logger.debug(f"ImageMagick exception for {src}: {e}")
+        _record_backend_failure("ImageMagick", src, f"{type(e).__name__}: {e}")
         return False
 
 
@@ -152,10 +191,11 @@ def convert_with_ffmpeg(src: str, dst: str, fmt: str) -> bool:
         r = subprocess.run(cmd, capture_output=True, timeout=60)
         if r.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0:
             return True
-        logger.debug(f"ffmpeg failed for {src}: {r.stderr.decode(errors='replace')[:200]}")
+        stderr = r.stderr.decode(errors="replace")
+        _record_backend_failure("ffmpeg", src, f"returncode={r.returncode} stderr={stderr}")
         return False
     except Exception as e:
-        logger.debug(f"ffmpeg exception for {src}: {e}")
+        _record_backend_failure("ffmpeg", src, f"{type(e).__name__}: {e}")
         return False
 
 
@@ -175,7 +215,7 @@ def convert_with_tiffcp(src: str, dst: str, fmt: str) -> bool:
         os.unlink(tmp_path)
         return result
     except Exception as e:
-        logger.debug(f"tiffcp failed for {src}: {e}")
+        _record_backend_failure("tiffcp", src, f"{type(e).__name__}: {e}")
         return False
 
 
@@ -195,10 +235,10 @@ def convert_jxr(src: str, dst: str, fmt: str) -> bool:
         os.unlink(tmp_path)
         return result
     except FileNotFoundError:
-        logger.debug("JxrDecApp not installed")
+        _record_backend_failure("JxrDecApp", src, "not installed")
         return False
     except Exception as e:
-        logger.debug(f"JxrDecApp failed for {src}: {e}")
+        _record_backend_failure("JxrDecApp", src, f"{type(e).__name__}: {e}")
         return False
 
 
@@ -300,16 +340,26 @@ def convert_image(src_path: str, dst_path: str, fmt: str = "png") -> bool:
             ("tiffcp", convert_with_tiffcp),
         ]
 
-    for name, backend in backends:
-        if backend(src_path, dst_path, fmt):
-            logger.info(f"Converted {src_path} with {name}")
-            return True
-        if ext == ".psd" and name == "ImageMagick":
-            logger.warning(
-                "PSD ImageMagick conversion failed; falling back to other backends "
-                "may expose layer/channel artifacts: %s",
-                src_path,
-            )
+    backend_failures: list[dict[str, str]] = []
+    token = _backend_failures_var.set(backend_failures)
+    try:
+        for name, backend in backends:
+            if backend(src_path, dst_path, fmt):
+                logger.info(f"Converted {src_path} with {name}")
+                return True
+            if ext == ".psd" and name == "ImageMagick":
+                logger.warning(
+                    "PSD ImageMagick conversion failed; falling back to other backends "
+                    "may expose layer/channel artifacts: %s",
+                    src_path,
+                )
+    finally:
+        _backend_failures_var.reset(token)
 
-    logger.error(f"All backends failed for {src_path}")
+    logger.error(
+        "All backends failed for %s; diagnostics=%s; backend_failures=%s",
+        src_path,
+        _file_diagnostics(src_path),
+        backend_failures,
+    )
     return False

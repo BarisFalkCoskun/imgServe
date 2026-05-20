@@ -231,6 +231,10 @@ def test_prefetch_task_uses_local_copy_and_cleans_it_after_conversion(tmp_path, 
     local_source = Path(prefetched_task.local_source_path)
     assert local_source.read_bytes() == original_bytes
     assert local_source.parent == prefetch_dir
+    assert prefetched_task.source_bytes == len(original_bytes)
+    assert prefetched_task.source_stat_bytes_before == len(original_bytes)
+    assert prefetched_task.source_stat_bytes_after == len(original_bytes)
+    assert prefetched_task.prefetch_size_match is True
 
     def fake_convert(src_path, dst_path, fmt):
         assert src_path == str(local_source)

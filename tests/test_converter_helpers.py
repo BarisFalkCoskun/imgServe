@@ -72,6 +72,20 @@ def test_convert_image_handles_jpg_to_webp(tmp_path):
     assert Image.open(dst).format == "WEBP"
 
 
+def test_convert_image_logs_failure_diagnostics(tmp_path, caplog):
+    src = tmp_path / "broken.jpg"
+    src.write_bytes(b"not an image")
+    dst = tmp_path / "out.webp"
+
+    with caplog.at_level("ERROR", logger="imgserve.converter"):
+        assert convert_image(str(src), str(dst), "webp") is False
+
+    message = "\n".join(record.getMessage() for record in caplog.records)
+    assert "All backends failed" in message
+    assert "backend_failures" in message
+    assert "header_hex" in message
+
+
 def test_convert_image_prefers_imagemagick_for_psd(tmp_path, monkeypatch):
     calls = []
     src = tmp_path / "source.psd"

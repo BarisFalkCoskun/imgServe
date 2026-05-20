@@ -71,6 +71,9 @@ class ConversionTask:
     local_source_path: str | None = None
     prefetch_elapsed_seconds: float | None = None
     source_bytes: int | None = None
+    source_stat_bytes_before: int | None = None
+    source_stat_bytes_after: int | None = None
+    prefetch_size_match: bool | None = None
 
 
 def utc_now() -> str:
@@ -696,6 +699,12 @@ def task_result(task: ConversionTask, status: str, elapsed_seconds: float, **ext
         payload["prefetch_elapsed_seconds"] = task.prefetch_elapsed_seconds
     if task.source_bytes is not None:
         payload["source_bytes"] = task.source_bytes
+    if task.source_stat_bytes_before is not None:
+        payload["source_stat_bytes_before"] = task.source_stat_bytes_before
+    if task.source_stat_bytes_after is not None:
+        payload["source_stat_bytes_after"] = task.source_stat_bytes_after
+    if task.prefetch_size_match is not None:
+        payload["prefetch_size_match"] = task.prefetch_size_match
     payload.update(extra)
     return payload
 
@@ -779,14 +788,39 @@ def prefetch_task(task: ConversionTask, prefetch_dir: str, event_log: str) -> di
     )
     os.close(tmp_fd)
     try:
+        try:
+            source_stat_bytes_before = source_path.stat().st_size
+        except OSError:
+            source_stat_bytes_before = None
         shutil.copyfile(source_path, tmp_source)
         source_bytes = Path(tmp_source).stat().st_size
+        try:
+            source_stat_bytes_after = source_path.stat().st_size
+        except OSError:
+            source_stat_bytes_after = None
+        source_sizes = [
+            size
+            for size in (source_stat_bytes_before, source_stat_bytes_after)
+            if size is not None
+        ]
+        prefetch_size_match = not source_sizes or all(size == source_bytes for size in source_sizes)
+        if not prefetch_size_match:
+            logger.warning(
+                "Prefetch size mismatch: source=%s before=%s after=%s local=%s",
+                task.source_path,
+                source_stat_bytes_before,
+                source_stat_bytes_after,
+                source_bytes,
+            )
         elapsed = time.monotonic() - started
         prefetched = dataclasses.replace(
             task,
             local_source_path=tmp_source,
             prefetch_elapsed_seconds=round(elapsed, 3),
             source_bytes=source_bytes,
+            source_stat_bytes_before=source_stat_bytes_before,
+            source_stat_bytes_after=source_stat_bytes_after,
+            prefetch_size_match=prefetch_size_match,
         )
         result = {
             "status": "prefetched",
@@ -795,6 +829,9 @@ def prefetch_task(task: ConversionTask, prefetch_dir: str, event_log: str) -> di
             "filename": task.filename,
             "prefetch_elapsed_seconds": round(elapsed, 3),
             "source_bytes": source_bytes,
+            "source_stat_bytes_before": source_stat_bytes_before,
+            "source_stat_bytes_after": source_stat_bytes_after,
+            "prefetch_size_match": prefetch_size_match,
         }
         append_event_to(event_log, {"event": "prefetch_finish", **result})
         return {"status": "prefetched", "task": prefetched, "result": result}
