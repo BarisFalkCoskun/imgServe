@@ -102,24 +102,25 @@ The first request to a source converts + writes back to `--thumbnails-dir`. The 
 
 For a large one-time backfill, run the preconverter on a stronger machine against the same mounted storage. It uses the same conversion rules as the server, never modifies source files, skips passthrough types such as videos/PDF/HTML, and writes canonical WebP files into the thumbnails tree.
 
-By default the preconverter pipelines the work: a small thread pool copies upcoming source files from Storage Box into a bounded local SSD prefetch directory while separate process workers convert already-prefetched files. This keeps the CPUs busy without leaving a large permanent cache on the server; prefetched source copies are deleted after their conversion task finishes.
+By default the preconverter streams the scan into the worker pipeline: while it is still walking Storage Box and checking which WebPs already exist, a small thread pool copies upcoming source files into a bounded local SSD prefetch directory and separate process workers convert already-prefetched files. This keeps the CPUs busy without leaving a large permanent cache on the server; prefetched source copies are deleted after their conversion task finishes.
+
+For low SSD usage, write converted WebPs to local SSD first, sync each completed WebP to Storage Box in the background, and delete the local WebP only after the final copy exists:
 
 ```bash
 uv run python preconvert_thumbnails.py \
   --source-root /mnt/storagebox/imgs \
   --folder salling \
+  --priority-list list.txt \
   --thumbnails-dir /local-ssd/thumbnails \
+  --sync-to-thumbnails-dir /mnt/storagebox/thumbnails \
+  --delete-local-after-sync \
   --tmp-dir /local-ssd/tmp \
   --prefetch-dir /local-ssd/prefetch \
-  --workers 8 \
+  --workers 16 \
   --prefetch-workers 4 \
-  --prefetch-buffer 24
-```
-
-Then sync completed WebP files back to the shared thumbnails folder:
-
-```bash
-rsync -a --ignore-existing /local-ssd/thumbnails/salling/ /mnt/storagebox/thumbnails/salling/
+  --prefetch-buffer 40 \
+  --sync-workers 2 \
+  --sync-buffer 24
 ```
 
 Progress and worker state are written under `state/preconvert/` by default:
@@ -131,7 +132,9 @@ ls state/preconvert/workers/
 tail -f state/preconvert/events.jsonl
 ```
 
-Use `--dry-run` to see how many files would be queued without converting. Existing `{basename}.webp` files are skipped unless `--force` is passed. Use `--no-prefetch` to disable local source prefetching and convert directly from the mounted source paths. During a large Storage Box scan, `scan.json` and `events.jsonl` are updated before conversion starts; tune this with `--scan-log-interval` and `--scan-log-seconds`.
+Use `--priority-list list.txt` to process likely-needed files first. The list can contain paths such as `/salling/<hash>.jpg`; each line is resolved against `--source-root/--folder`, and completion is checked by basename/stem, so `/salling/foo.jpg` is skipped if `foo.webp` already exists in the local or final thumbnails directory. After all priority entries are handled, the script continues with the remaining source files.
+
+Use `--dry-run` to see how many files would be queued without converting. Existing `{basename}.webp` files are skipped unless `--force` is passed. When `--sync-to-thumbnails-dir` is set, that final directory is also treated as completed during scan/resume, so files already synced to Storage Box are skipped even if the local SSD copy has been deleted. Use `--no-prefetch` to disable local source prefetching and convert directly from the mounted source paths. During a large Storage Box scan, `scan.json` and `events.jsonl` are updated continuously; tune this with `--scan-log-interval`, `--scan-log-seconds`, and `--priority-log-interval`.
 
 ### CLI flags
 

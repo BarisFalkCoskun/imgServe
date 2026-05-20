@@ -47,6 +47,120 @@ def test_build_tasks_skips_existing_and_passthrough(tmp_path):
     assert Path(tasks[0].dest_path) == thumbnails_dir / "salling" / "image.webp"
 
 
+def test_task_scanner_yields_before_scanning_full_source_dir(tmp_path):
+    source_dir = tmp_path / "imgs" / "salling"
+    thumbnails_dir = tmp_path / "thumbnails"
+    state_dir = tmp_path / "state"
+    source_dir.mkdir(parents=True)
+    thumbnails_dir.mkdir()
+    state_dir.mkdir()
+
+    (source_dir / "first.jpg").write_bytes(b"jpg")
+    (source_dir / "second.png").write_bytes(b"png")
+
+    scanner = preconvert.TaskScanner(
+        source_dir=source_dir,
+        thumbnails_dir=thumbnails_dir,
+        state_dir=state_dir,
+        folder="salling",
+        force=False,
+        tmp_dir=tmp_path,
+    )
+
+    first_task = next(scanner.iter_tasks())
+
+    assert Path(first_task.source_path).name in {"first.jpg", "second.png"}
+    assert scanner.stats["seen"] == 1
+    assert scanner.stats["queued"] == 1
+
+
+def test_build_tasks_skips_when_completed_thumbnail_exists_elsewhere(tmp_path):
+    source_dir = tmp_path / "imgs" / "salling"
+    local_thumbnails_dir = tmp_path / "local-thumbnails"
+    completed_thumbnails_dir = tmp_path / "final-thumbnails"
+    state_dir = tmp_path / "state"
+    source_dir.mkdir(parents=True)
+    (completed_thumbnails_dir / "salling").mkdir(parents=True)
+
+    (source_dir / "already.jpg").write_bytes(b"jpg")
+    (completed_thumbnails_dir / "salling" / "already.webp").write_bytes(b"done")
+
+    tasks, stats = preconvert.build_tasks(
+        source_dir=source_dir,
+        thumbnails_dir=local_thumbnails_dir,
+        completed_thumbnails_dirs=[completed_thumbnails_dir],
+        state_dir=state_dir,
+        folder="salling",
+        force=False,
+        tmp_dir=tmp_path,
+    )
+
+    assert tasks == []
+    assert stats["queued"] == 0
+    assert stats["skipped_completed"] == 1
+    assert stats["completed_exists_checks"] == 1
+
+
+def test_priority_list_tasks_are_queued_before_fallback(tmp_path):
+    source_dir = tmp_path / "imgs" / "salling"
+    thumbnails_dir = tmp_path / "thumbnails"
+    state_dir = tmp_path / "state"
+    priority_list = tmp_path / "list.txt"
+    source_dir.mkdir(parents=True)
+
+    (source_dir / "fallback.jpg").write_bytes(b"jpg")
+    (source_dir / "first.jpg").write_bytes(b"jpg")
+    (source_dir / "second.png").write_bytes(b"png")
+    priority_list.write_text("/salling/second.png\n/salling/first.jpg\n", encoding="utf-8")
+
+    tasks, stats = preconvert.build_tasks(
+        source_dir=source_dir,
+        thumbnails_dir=thumbnails_dir,
+        priority_list=priority_list,
+        state_dir=state_dir,
+        folder="salling",
+        force=False,
+        tmp_dir=tmp_path,
+    )
+
+    assert [Path(task.source_path).name for task in tasks[:2]] == ["second.png", "first.jpg"]
+    assert {Path(task.source_path).name for task in tasks} == {"second.png", "first.jpg", "fallback.jpg"}
+    assert stats["priority_entries"] == 2
+    assert stats["priority_queued"] == 2
+    assert stats["fallback_skipped_priority_stem"] == 2
+
+
+def test_priority_list_skips_final_thumbnail_even_when_local_missing(tmp_path):
+    source_dir = tmp_path / "imgs" / "salling"
+    local_thumbnails_dir = tmp_path / "local-thumbnails"
+    final_thumbnails_dir = tmp_path / "final-thumbnails"
+    state_dir = tmp_path / "state"
+    priority_list = tmp_path / "list.txt"
+    source_dir.mkdir(parents=True)
+    (final_thumbnails_dir / "salling").mkdir(parents=True)
+
+    (source_dir / "already.jpg").write_bytes(b"jpg")
+    (final_thumbnails_dir / "salling" / "already.webp").write_bytes(b"done")
+    priority_list.write_text("/salling/already.jpg\n", encoding="utf-8")
+
+    tasks, stats = preconvert.build_tasks(
+        source_dir=source_dir,
+        thumbnails_dir=local_thumbnails_dir,
+        completed_thumbnails_dirs=[final_thumbnails_dir],
+        priority_list=priority_list,
+        state_dir=state_dir,
+        folder="salling",
+        force=False,
+        tmp_dir=tmp_path,
+    )
+
+    assert tasks == []
+    assert stats["priority_entries"] == 1
+    assert stats["priority_skipped_completed"] == 1
+    assert stats["skipped_completed"] == 1
+    assert stats["fallback_skipped_priority_stem"] == 1
+
+
 def test_process_task_writes_thumbnail_without_modifying_source(tmp_path, monkeypatch):
     source_dir = tmp_path / "imgs" / "salling"
     thumbnails_dir = tmp_path / "thumbnails"
@@ -135,3 +249,31 @@ def test_prefetch_task_uses_local_copy_and_cleans_it_after_conversion(tmp_path, 
     assert source.read_bytes() == original_bytes
     assert not local_source.exists()
     assert (thumbnails_dir / "salling" / "image.webp").read_bytes() == b"converted webp"
+
+
+def test_sync_converted_result_copies_to_final_and_deletes_local(tmp_path):
+    local_thumbnails_dir = tmp_path / "local-thumbnails"
+    final_thumbnails_dir = tmp_path / "final-thumbnails"
+    state_dir = tmp_path / "state"
+    local_path = local_thumbnails_dir / "salling" / "image.webp"
+    local_path.parent.mkdir(parents=True)
+    state_dir.mkdir()
+    local_path.write_bytes(b"converted webp")
+
+    result = preconvert.sync_converted_result(
+        {
+            "status": "converted",
+            "source_path": str(tmp_path / "imgs" / "salling" / "image.jpg"),
+            "folder": "salling",
+            "filename": "image.jpg",
+            "dest_path": str(local_path),
+        },
+        str(final_thumbnails_dir),
+        True,
+        str(state_dir / "events.jsonl"),
+    )
+
+    assert result["status"] == "synced"
+    assert result["local_deleted"] is True
+    assert not local_path.exists()
+    assert (final_thumbnails_dir / "salling" / "image.webp").read_bytes() == b"converted webp"
