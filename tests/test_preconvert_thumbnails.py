@@ -1,6 +1,25 @@
+import multiprocessing
 from pathlib import Path
 
 import preconvert_thumbnails as preconvert
+
+
+def test_choose_process_start_method_auto_avoids_fork_when_possible():
+    method = preconvert.choose_process_start_method("auto")
+    available = multiprocessing.get_all_start_methods()
+    if "forkserver" in available:
+        assert method == "forkserver"
+    elif "spawn" in available:
+        assert method == "spawn"
+    else:
+        assert method in available
+
+
+def test_choose_process_start_method_respects_requested_spawn_when_available():
+    if "spawn" not in multiprocessing.get_all_start_methods():
+        return
+
+    assert preconvert.choose_process_start_method("spawn") == "spawn"
 
 
 def test_build_tasks_skips_existing_and_passthrough(tmp_path):

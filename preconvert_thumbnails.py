@@ -21,6 +21,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import shutil
 import tempfile
@@ -43,6 +44,7 @@ DEFAULT_SCAN_LOG_INTERVAL = 1000
 DEFAULT_SCAN_LOG_SECONDS = 10.0
 DEFAULT_SYNC_WORKERS = 2
 DEFAULT_PRIORITY_LOG_INTERVAL = 1000
+DEFAULT_PROCESS_START_METHOD = "auto"
 EVENT_LOG_NAME = "events.jsonl"
 
 logger = logging.getLogger("imgserve.preconvert")
@@ -85,6 +87,19 @@ def configure_logging(verbose: bool) -> None:
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
+
+
+def choose_process_start_method(requested: str = DEFAULT_PROCESS_START_METHOD) -> str:
+    available = multiprocessing.get_all_start_methods()
+    if requested != "auto":
+        if requested not in available:
+            raise ValueError(f"multiprocessing start method is not available: {requested}")
+        return requested
+
+    for method in ("forkserver", "spawn"):
+        if method in available:
+            return method
+    return multiprocessing.get_start_method(allow_none=True) or available[0]
 
 
 def source_dir_for(source_root: Path, folder: str) -> Path:
@@ -939,6 +954,7 @@ def run_direct_conversion(
     workers: int,
     state_dir: Path,
     summary: dict[str, Any],
+    process_context: multiprocessing.context.BaseContext,
     sync_to_thumbnails_dir: Path | None,
     delete_local_after_sync: bool,
     sync_workers: int,
@@ -975,6 +991,7 @@ def run_direct_conversion(
             max_workers=workers,
             initializer=init_worker,
             initargs=(str(state_dir),),
+            mp_context=process_context,
         ) as executor:
             submit_more(executor)
             while pending or pending_sync or not source_exhausted:
@@ -1020,6 +1037,7 @@ def run_prefetch_pipeline(
     workers: int,
     state_dir: Path,
     summary: dict[str, Any],
+    process_context: multiprocessing.context.BaseContext,
     prefetch_dir: Path,
     prefetch_workers: int,
     prefetch_buffer: int,
@@ -1076,6 +1094,7 @@ def run_prefetch_pipeline(
                 max_workers=workers,
                 initializer=init_worker,
                 initargs=(str(state_dir),),
+                mp_context=process_context,
             ) as convert_executor:
                 last_logged_completed = -1
                 submit_prefetches(prefetch_executor)
@@ -1180,6 +1199,9 @@ def parse_args() -> argparse.Namespace:
                         help=f"Log scan progress after this many seconds during scanning (default: {DEFAULT_SCAN_LOG_SECONDS:g})")
     parser.add_argument("--priority-log-interval", type=int, default=DEFAULT_PRIORITY_LOG_INTERVAL,
                         help=f"Log priority-list progress after this many list entries (default: {DEFAULT_PRIORITY_LOG_INTERVAL})")
+    parser.add_argument("--process-start-method", default=DEFAULT_PROCESS_START_METHOD,
+                        choices=["auto", *multiprocessing.get_all_start_methods()],
+                        help="Multiprocessing start method for conversion workers; auto prefers forkserver/spawn to avoid rawpy/OpenMP fork deadlocks")
     parser.add_argument("--limit", type=int, default=None,
                         help="Only queue this many convertible missing files")
     parser.add_argument("--force", action="store_true",
@@ -1241,6 +1263,8 @@ def main() -> int:
         if args.sync_buffer is not None
         else max(args.workers * 2, args.sync_workers * 4)
     )
+    process_start_method = choose_process_start_method(args.process_start_method)
+    process_context = multiprocessing.get_context(process_start_method)
     prefetch_dir = Path(args.prefetch_dir).resolve() if args.prefetch_dir else tmp_dir / "preconvert-prefetch"
     state_dir.mkdir(parents=True, exist_ok=True)
     workers_dir = state_dir / "workers"
@@ -1285,6 +1309,8 @@ def main() -> int:
         "completed_thumbnails_dirs": [str(path) for path in completed_thumbnails_dirs],
         "folder": folder,
         "workers": args.workers,
+        "process_start_method": process_start_method,
+        "requested_process_start_method": args.process_start_method,
         "force": args.force,
         "dry_run": args.dry_run,
         "sync": {
@@ -1318,6 +1344,11 @@ def main() -> int:
     write_summary(state_dir, summary)
     logger.info("Worker status: %s", state_dir / "workers")
     logger.info("Event log: %s", state_dir / EVENT_LOG_NAME)
+    logger.info(
+        "Conversion worker multiprocessing start method: %s requested=%s",
+        process_start_method,
+        args.process_start_method,
+    )
     if args.no_prefetch:
         logger.info("Prefetch disabled; conversion workers will read directly from source paths")
     else:
@@ -1352,6 +1383,7 @@ def main() -> int:
             args.workers,
             state_dir,
             summary,
+            process_context,
             sync_to_thumbnails_dir,
             args.delete_local_after_sync,
             args.sync_workers,
@@ -1363,6 +1395,7 @@ def main() -> int:
             workers=args.workers,
             state_dir=state_dir,
             summary=summary,
+            process_context=process_context,
             prefetch_dir=prefetch_dir,
             prefetch_workers=prefetch_workers,
             prefetch_buffer=prefetch_buffer,
