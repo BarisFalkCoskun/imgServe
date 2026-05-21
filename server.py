@@ -36,12 +36,13 @@ import os
 import shutil
 import tempfile
 import time
+from urllib.parse import quote
 from contextlib import contextmanager
 
 import fcntl
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from starlette.background import BackgroundTask
 
 from converter import (
@@ -69,6 +70,10 @@ ENV_STATE_DIR = "IMGSERVE_STATE_DIR"
 CACHE_CONVERSION_SLOTS_DIR_NAME = ".conversion-slots"
 IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
 DIRECT_SOURCE_CACHE_CONTROL = "public, max-age=3600"
+DOCUMENT_ALTERNATE_EXTS = {
+    ".docx": ".pdf",
+    ".pdf": ".docx",
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -294,6 +299,27 @@ def _file_response(path: str, media_type: str, cache_control: str) -> FileRespon
     return FileResponse(path, media_type=media_type, headers={"Cache-Control": cache_control})
 
 
+def find_alternate_document(folder: str, filename: str, imgs_dir: str) -> tuple[str, str] | None:
+    basename, ext = os.path.splitext(filename)
+    alternate_ext = DOCUMENT_ALTERNATE_EXTS.get(ext.lower())
+    if alternate_ext is None:
+        return None
+
+    alternate_filename = f"{basename}{alternate_ext}"
+    alternate_path = os.path.join(imgs_dir, folder, alternate_filename)
+    if os.path.isfile(alternate_path):
+        return alternate_filename, alternate_path
+
+    return None
+
+
+def document_redirect_url(request: Request, folder: str, filename: str) -> str:
+    url = f"/imgs/{quote(folder, safe='')}/{quote(filename, safe='')}"
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+    return url
+
+
 def promote_to_thumbnails(local_path: str, thumbnails_dir: str, folder: str, filename: str) -> bool:
     """Copy a freshly-converted WebP into the thumbnails directory atomically.
 
@@ -415,6 +441,23 @@ def create_app(log_config: bool = True) -> FastAPI:
         # 2. Source must exist.
         src_path = os.path.join(request.app.state.imgs_dir, folder, filename)
         if not os.path.isfile(src_path):
+            alternate = find_alternate_document(folder, filename, request.app.state.imgs_dir)
+            if alternate is not None:
+                alternate_filename, alternate_path = alternate
+                logger.info(
+                    "Redirecting missing document to alternate extension: pid=%s requested=%s/%s "
+                    "alternate=%s/%s path=%s",
+                    os.getpid(),
+                    folder,
+                    filename,
+                    folder,
+                    alternate_filename,
+                    alternate_path,
+                )
+                return RedirectResponse(
+                    document_redirect_url(request, folder, alternate_filename),
+                    status_code=307,
+                )
             raise HTTPException(status_code=404, detail="Image not found")
 
         ext = os.path.splitext(filename)[1].lower()

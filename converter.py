@@ -311,7 +311,7 @@ CONVERT_FORMATS = {".psd", ".tif", ".tiff", ".jxr"}
 RAW_EXTS = {".nef", ".arw", ".dng", ".cr2", ".cr3", ".raf", ".rw2", ".orf", ".pef", ".srw"}
 
 # Types we deliberately stream from the source without any conversion.
-PASSTHROUGH_EXTS = {".mp4", ".mov", ".m4v", ".html", ".pdf"}
+PASSTHROUGH_EXTS = {".mp4", ".mov", ".m4v", ".html", ".pdf", ".docx"}
 
 
 def is_passthrough(ext: str) -> bool:
@@ -359,6 +359,7 @@ def get_content_type(ext: str) -> str:
         ".m4v": "video/x-m4v",
         ".html": "text/html; charset=utf-8",
         ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     }
     return types.get(ext.lower(), "application/octet-stream")
 

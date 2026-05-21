@@ -13,6 +13,7 @@ from converter import get_content_type, PASSTHROUGH_EXTS, RAW_EXTS, is_passthrou
     (".m4v", "video/x-m4v"),
     (".html", "text/html; charset=utf-8"),
     (".pdf", "application/pdf"),
+    (".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
     (".JPG", "image/jpeg"),         # case-insensitive
     (".bogus", "application/octet-stream"),
 ])
@@ -26,6 +27,7 @@ def test_passthrough_constants():
     assert ".m4v" in PASSTHROUGH_EXTS
     assert ".html" in PASSTHROUGH_EXTS
     assert ".pdf" in PASSTHROUGH_EXTS
+    assert ".docx" in PASSTHROUGH_EXTS
 
 
 def test_raw_constants():
@@ -37,6 +39,7 @@ def test_raw_constants():
     (".mp4", True),                # explicit passthrough
     (".HTML", True),               # case-insensitive passthrough
     (".pdf", True),
+    (".docx", True),
     (".jpg", False),               # web image — needs WebP conversion
     (".png", False),
     (".psd", False),               # convertible image
