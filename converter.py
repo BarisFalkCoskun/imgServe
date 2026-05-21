@@ -16,12 +16,14 @@ import subprocess
 import tempfile
 import logging
 import contextvars
+import math
 from PIL import Image
 
 logger = logging.getLogger("imgserve.converter")
 
 Image.MAX_IMAGE_PIXELS = None
 WEBP_MAX_DIMENSION = 16383
+WEBP_MAX_PIXELS = 100_000_000
 RESAMPLE_LANCZOS = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
 
 _backend_failures_var: contextvars.ContextVar[list[dict[str, str]] | None] = contextvars.ContextVar(
@@ -87,23 +89,28 @@ def resize_for_webp_limit(img: Image.Image, src: str, fmt: str) -> Image.Image:
 
     width, height = img.size
     max_side = max(width, height)
-    if max_side <= WEBP_MAX_DIMENSION:
+    pixel_count = width * height
+    if max_side <= WEBP_MAX_DIMENSION and pixel_count <= WEBP_MAX_PIXELS:
         return img
 
-    scale = WEBP_MAX_DIMENSION / max_side
+    scale = min(
+        WEBP_MAX_DIMENSION / max_side,
+        math.sqrt(WEBP_MAX_PIXELS / pixel_count),
+    )
     resized_size = (
         max(1, min(WEBP_MAX_DIMENSION, int(width * scale))),
         max(1, min(WEBP_MAX_DIMENSION, int(height * scale))),
     )
     logger.info(
         "Resizing image for WebP limit: src=%s original_size=%sx%s resized_size=%sx%s "
-        "limit=%s scale=%.6f",
+        "max_dimension=%s max_pixels=%s scale=%.6f",
         src,
         width,
         height,
         resized_size[0],
         resized_size[1],
         WEBP_MAX_DIMENSION,
+        WEBP_MAX_PIXELS,
         scale,
     )
     return img.resize(resized_size, RESAMPLE_LANCZOS)

@@ -132,6 +132,33 @@ def test_pillow_resizes_oversized_webp_proportionally(
     expected_size,
 ):
     monkeypatch.setattr(converter, "WEBP_MAX_DIMENSION", 16)
+    monkeypatch.setattr(converter, "WEBP_MAX_PIXELS", 1_000)
+    src = tmp_path / "src.png"
+    Image.new("RGB", source_size, (10, 200, 10)).save(src, format="PNG")
+    dst = tmp_path / "out.webp"
+
+    assert converter.convert_with_pillow(str(src), str(dst), "webp") is True
+
+    img = Image.open(dst)
+    assert img.format == "WEBP"
+    assert img.size == expected_size
+
+
+@pytest.mark.parametrize(
+    "source_size,expected_size",
+    [
+        ((20, 10), (14, 7)),
+        ((10, 20), (7, 14)),
+    ],
+)
+def test_pillow_resizes_high_pixel_count_webp_proportionally(
+    tmp_path,
+    monkeypatch,
+    source_size,
+    expected_size,
+):
+    monkeypatch.setattr(converter, "WEBP_MAX_DIMENSION", 100)
+    monkeypatch.setattr(converter, "WEBP_MAX_PIXELS", 100)
     src = tmp_path / "src.png"
     Image.new("RGB", source_size, (10, 200, 10)).save(src, format="PNG")
     dst = tmp_path / "out.webp"
