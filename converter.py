@@ -21,6 +21,8 @@ from PIL import Image
 logger = logging.getLogger("imgserve.converter")
 
 Image.MAX_IMAGE_PIXELS = None
+WEBP_MAX_DIMENSION = 16383
+RESAMPLE_LANCZOS = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
 
 _backend_failures_var: contextvars.ContextVar[list[dict[str, str]] | None] = contextvars.ContextVar(
     "backend_failures",
@@ -79,6 +81,34 @@ def choose_output_format(img: Image.Image, requested_format: str | None) -> str:
     return "webp"
 
 
+def resize_for_webp_limit(img: Image.Image, src: str, fmt: str) -> Image.Image:
+    if fmt.lower() != "webp":
+        return img
+
+    width, height = img.size
+    max_side = max(width, height)
+    if max_side <= WEBP_MAX_DIMENSION:
+        return img
+
+    scale = WEBP_MAX_DIMENSION / max_side
+    resized_size = (
+        max(1, min(WEBP_MAX_DIMENSION, int(width * scale))),
+        max(1, min(WEBP_MAX_DIMENSION, int(height * scale))),
+    )
+    logger.info(
+        "Resizing image for WebP limit: src=%s original_size=%sx%s resized_size=%sx%s "
+        "limit=%s scale=%.6f",
+        src,
+        width,
+        height,
+        resized_size[0],
+        resized_size[1],
+        WEBP_MAX_DIMENSION,
+        scale,
+    )
+    return img.resize(resized_size, RESAMPLE_LANCZOS)
+
+
 def convert_with_rawpy(src: str, dst: str, fmt: str) -> bool:
     """Camera RAW via libraw — proper demosaic + camera color matrix → sRGB.
 
@@ -102,6 +132,7 @@ def convert_with_rawpy(src: str, dst: str, fmt: str) -> bool:
                 no_auto_bright=False,
             )
         img = Image.fromarray(rgb)  # numpy → PIL, mode='RGB'
+        img = resize_for_webp_limit(img, src, fmt)
         out_fmt = fmt.upper()
         if out_fmt == "JPG":
             out_fmt = "JPEG"
@@ -121,6 +152,25 @@ def convert_with_pillow(src: str, dst: str, fmt: str) -> bool:
     """Convert using Pillow. Handles PSD (composite), most standard formats."""
     try:
         with Image.open(src) as img:
+            logger.debug(
+                "Pillow opened image: src=%s format=%s mode=%s size=%sx%s target_format=%s",
+                src,
+                img.format,
+                img.mode,
+                img.width,
+                img.height,
+                fmt,
+            )
+            if fmt.lower() == "webp" and (
+                img.width > WEBP_MAX_DIMENSION or img.height > WEBP_MAX_DIMENSION
+            ):
+                logger.info(
+                    "Pillow image exceeds WebP encoder dimension limit: src=%s size=%sx%s limit=%s",
+                    src,
+                    img.width,
+                    img.height,
+                    WEBP_MAX_DIMENSION,
+                )
             img.load()
 
             # Apply embedded ICC profile → sRGB for color-accurate output.
@@ -157,6 +207,8 @@ def convert_with_pillow(src: str, dst: str, fmt: str) -> bool:
                 img = img.convert("RGB")
             elif img.mode == "CMYK":
                 img = img.convert("RGBA" if has_transparency(img) else "RGB")
+
+            img = resize_for_webp_limit(img, src, fmt)
 
             save_kwargs = {"format": out_fmt, "quality": 95}
             if out_fmt == "WEBP":

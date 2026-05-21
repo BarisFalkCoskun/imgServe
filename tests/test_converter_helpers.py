@@ -116,3 +116,28 @@ def test_pillow_converts_png_without_icc(tmp_path):
     assert convert_with_pillow(str(src), str(dst), "webp") is True
     img = Image.open(dst)
     assert img.format == "WEBP" and img.size == (8, 8)
+
+
+@pytest.mark.parametrize(
+    "source_size,expected_size",
+    [
+        ((20, 10), (16, 8)),
+        ((10, 20), (8, 16)),
+    ],
+)
+def test_pillow_resizes_oversized_webp_proportionally(
+    tmp_path,
+    monkeypatch,
+    source_size,
+    expected_size,
+):
+    monkeypatch.setattr(converter, "WEBP_MAX_DIMENSION", 16)
+    src = tmp_path / "src.png"
+    Image.new("RGB", source_size, (10, 200, 10)).save(src, format="PNG")
+    dst = tmp_path / "out.webp"
+
+    assert converter.convert_with_pillow(str(src), str(dst), "webp") is True
+
+    img = Image.open(dst)
+    assert img.format == "WEBP"
+    assert img.size == expected_size
