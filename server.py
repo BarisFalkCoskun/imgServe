@@ -10,17 +10,12 @@ import argparse
 import logging
 import mimetypes
 import os
-import shutil
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 DEFAULT_IMAGES_DIR = "/mnt/groceryImgsOnly/thumbnails"
-# Compatibility imports used by preconvert_thumbnails.py. The web app never
-# reads from DEFAULT_IMGS_BASE or calls promote_to_thumbnails.
-DEFAULT_IMGS_BASE = DEFAULT_IMAGES_DIR
-DEFAULT_THUMBNAILS_DIR = DEFAULT_IMAGES_DIR
 DEFAULT_PORT = 8101
 DEFAULT_WORKERS = 2
 ALLOWED_FOLDERS = frozenset({"coop", "salling", "dagrofa", "rema1000"})
@@ -98,33 +93,6 @@ def _is_file_within(path: str, directory: str) -> bool:
             and os.path.isfile(resolved_path)
         )
     except (OSError, ValueError):
-        return False
-
-
-def promote_to_thumbnails(
-    local_path: str,
-    thumbnails_dir: str,
-    folder: str,
-    filename: str,
-) -> bool:
-    """Compatibility helper for the standalone preconverter, not the web app."""
-    basename = os.path.splitext(filename)[0]
-    destination_dir = os.path.join(thumbnails_dir, folder)
-    destination = os.path.join(destination_dir, f"{basename}.webp")
-    temporary = os.path.join(
-        destination_dir,
-        f".{basename}.{os.getpid()}.{os.urandom(4).hex()}.tmp",
-    )
-    try:
-        os.makedirs(destination_dir, exist_ok=True)
-        shutil.copyfile(local_path, temporary)
-        os.replace(temporary, destination)
-        return True
-    except OSError:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
         return False
 
 

@@ -55,6 +55,4 @@ instance because that would remove the intended separation from the regular serv
 python3 -m pytest -q
 ```
 
-Legacy write-through integration tests remain in the branch for comparison with
-`master`, but their removed source/conversion/write-back fixtures are explicitly
-skipped here. The active server tests are in `tests/test_server_helpers.py`.
+The server tests are in `tests/test_server_helpers.py`.

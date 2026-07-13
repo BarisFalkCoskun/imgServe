@@ -34,18 +34,3 @@ def put_image(grocery_root: Path):
         return path
 
     return _put_image
-
-
-@pytest.fixture
-def env_dirs():
-    pytest.skip("legacy write-through fixture is not used on the groceryImgsOnly branch")
-
-
-@pytest.fixture
-def put_source():
-    pytest.skip("source fallback is intentionally disabled on the groceryImgsOnly branch")
-
-
-@pytest.fixture
-def put_backup():
-    pytest.skip("thumbnail write-back is intentionally disabled on the groceryImgsOnly branch")

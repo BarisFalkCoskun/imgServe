@@ -1,8 +1,5 @@
 fastapi>=0.110
 uvicorn[standard]>=0.27
-Pillow>=10.0
-# Optional — enables proper RAW demosaicing for .nef/.arw/.dng/.cr2/.cr3
-rawpy>=0.19
 # Dev / test
 pytest>=8.0
 httpx>=0.27
