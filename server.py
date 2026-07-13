@@ -1,155 +1,36 @@
 #!/usr/bin/env python3
-"""
-imgServe — Internal image server with write-through conversion.
+"""Read-only image server for the temporary groceryImgsOnly dataset.
 
-Serves canonical WebP from /mnt/storagebox/thumbnails/ when available. On miss,
-falls back to /mnt/storagebox/imgs/, converts the source to WebP in /tmp,
-streams the result, and promotes the WebP into /mnt/storagebox/thumbnails/ via
-atomic rename so future requests skip conversion entirely.
-
-Non-image types (.mp4, .mov, .m4v, .html, .pdf, plus any unrecognized
-extension) are streamed from the source with the correct Content-Type.
-
-Camera RAW (.nef, .arw, .dng, .cr2, .cr3, .raf, .rw2, .orf, .pef, .srw)
-is decoded via libraw (rawpy) for proper demosaicing — no channel
-separation artifacts.
-
-Binds to 127.0.0.1 only — not accessible from the internet.
-
-Usage:
-  python3 server.py
-  python3 server.py --port 8100
-  python3 server.py --thumbnails-dir /mnt/storagebox/thumbnails
-
-Request examples:
-  GET /imgs/fillop/48e04f71...d956b4.jpg              → serves optimized WebP
-                                                        (converts + writes back on first hit)
-  GET /imgs/fillop/48e04f71...d956b4.psd              → converts to WebP, writes back
-  GET /imgs/fillop/48e04f71...d956b4.psd?format=png   → converts to PNG (not cached)
-  GET /imgs/clips/intro.mp4                           → streams source as video/mp4
-  GET /health                                         → health check
+This branch intentionally serves only exact image files below
+``/mnt/groceryImgsOnly/thumbnails/``. It has no fallback source tree, format
+conversion, or write-back path, so a missing file always produces a 404.
 """
 
 import argparse
 import logging
+import mimetypes
 import os
 import shutil
-import tempfile
-import time
-from urllib.parse import quote
-from contextlib import contextmanager
 
-import fcntl
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
-from starlette.background import BackgroundTask
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 
-from converter import (
-    FORMAT_TO_EXT,
-    convert_image,
-    get_content_type,
-    is_passthrough,
-)
-
-DEFAULT_IMGS_BASE = "/mnt/storagebox/imgs"
-DEFAULT_THUMBNAILS_DIR = "/mnt/storagebox/thumbnails"
-DEFAULT_STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
-DEFAULT_HEALTH_MIN_FREE_BYTES = 1 * 1024 * 1024 * 1024
-DEFAULT_CONVERSION_SLOTS = 1
-DEFAULT_CONVERSION_SLOT_TIMEOUT_SECONDS = 30
+DEFAULT_IMAGES_DIR = "/mnt/groceryImgsOnly/thumbnails"
+# Compatibility imports used by preconvert_thumbnails.py. The web app never
+# reads from DEFAULT_IMGS_BASE or calls promote_to_thumbnails.
+DEFAULT_IMGS_BASE = DEFAULT_IMAGES_DIR
+DEFAULT_THUMBNAILS_DIR = DEFAULT_IMAGES_DIR
+DEFAULT_PORT = 8101
 DEFAULT_WORKERS = 2
-ENV_IMGS_DIR = "IMGSERVE_IMGS_DIR"
-ENV_HEALTH_MIN_FREE_BYTES = "IMGSERVE_HEALTH_MIN_FREE_BYTES"
-ENV_CONVERSION_SLOTS = "IMGSERVE_CONVERSION_SLOTS"
-ENV_CONVERSION_SLOT_TIMEOUT_SECONDS = "IMGSERVE_CONVERSION_SLOT_TIMEOUT_SECONDS"
-ENV_THUMBNAILS_DIR = "IMGSERVE_THUMBNAILS_DIR"
-ENV_LEGACY_IMGSBACKUP_DIR = "IMGSERVE_IMGSBACKUP_DIR"
-ENV_IMGSBACKUP_PRIMARY = ENV_LEGACY_IMGSBACKUP_DIR
-ENV_STATE_DIR = "IMGSERVE_STATE_DIR"
-CACHE_CONVERSION_SLOTS_DIR_NAME = ".conversion-slots"
+ALLOWED_FOLDERS = frozenset({"coop", "salling", "dagrofa", "rema1000"})
 IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
-DIRECT_SOURCE_CACHE_CONTROL = "public, max-age=3600"
-DOCUMENT_ALTERNATE_EXTS = {
-    ".docx": ".pdf",
-    ".pdf": ".docx",
-}
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
 )
 logger = logging.getLogger("imgserve")
-
-
-def _configured_path(env_name: str, default: str) -> str:
-    return os.path.abspath(os.environ.get(env_name, default))
-
-
-def _configured_thumbnails_dir() -> str:
-    raw = os.environ.get(ENV_THUMBNAILS_DIR)
-    if raw is not None:
-        return os.path.abspath(raw)
-
-    legacy = os.environ.get(ENV_LEGACY_IMGSBACKUP_DIR)
-    if legacy is not None:
-        logger.warning(
-            "%s is deprecated; use %s instead",
-            ENV_LEGACY_IMGSBACKUP_DIR,
-            ENV_THUMBNAILS_DIR,
-        )
-        return os.path.abspath(legacy)
-
-    return os.path.abspath(DEFAULT_THUMBNAILS_DIR)
-
-
-def _configured_nonnegative_int(env_name: str, default: int) -> int:
-    raw = os.environ.get(env_name)
-    if raw is None:
-        return default
-
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning("Invalid %s=%r; using default %s", env_name, raw, default)
-        return default
-
-    if value < 0:
-        logger.warning("Negative %s=%r; using default %s", env_name, raw, default)
-        return default
-
-    return value
-
-
-def _configured_positive_int(env_name: str, default: int) -> int:
-    raw = os.environ.get(env_name)
-    if raw is None:
-        return default
-
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning("Invalid %s=%r; using default %s", env_name, raw, default)
-        return default
-
-    if value <= 0:
-        logger.warning("Non-positive %s=%r; using default %s", env_name, raw, default)
-        return default
-
-    return value
-
-
-def _format_bytes(value: int) -> str:
-    if value < 1024:
-        return f"{value} B"
-
-    amount = float(value)
-    for unit in ("KiB", "MiB", "GiB", "TiB"):
-        amount /= 1024.0
-        if amount < 1024.0 or unit == "TiB":
-            return f"{amount:.1f} {unit}"
-
-    return f"{value} B"
 
 
 def _validate_path_component(value: str, label: str) -> str:
@@ -160,7 +41,7 @@ def _validate_path_component(value: str, label: str) -> str:
     if os.path.altsep:
         separators.add(os.path.altsep)
 
-    if any(sep in value for sep in separators):
+    if any(separator in value for separator in separators):
         raise HTTPException(status_code=400, detail=f"Invalid {label}")
 
     return value
@@ -173,10 +54,9 @@ def _check_readable_dir(path: str) -> dict[str, object]:
             raise FileNotFoundError(f"{path} is not a directory")
         if not os.access(path, os.R_OK | os.X_OK):
             raise PermissionError(f"{path} is not readable")
-
         with os.scandir(path):
             pass
-    except Exception as exc:
+    except OSError as exc:
         status["ok"] = False
         status["error"] = str(exc)
         return status
@@ -185,360 +65,126 @@ def _check_readable_dir(path: str) -> dict[str, object]:
     return status
 
 
-def _check_optimized_webp_dirs(thumbnail_read_dirs: list[str]) -> dict[str, object]:
-    checks = [_check_readable_dir(path) for path in thumbnail_read_dirs]
-    return {
-        "ok": any(bool(check.get("ok")) for check in checks),
-        "paths": checks,
+def _health_payload(images_dir: str) -> tuple[dict[str, object], int]:
+    root = _check_readable_dir(images_dir)
+    folders = {
+        folder: _check_readable_dir(os.path.join(images_dir, folder))
+        for folder in sorted(ALLOWED_FOLDERS)
     }
-
-
-def _check_thumbnails_write(thumbnails_dir: str, min_free_bytes: int) -> dict[str, object]:
-    status: dict[str, object] = {"path": thumbnails_dir}
-    try:
-        if not os.path.isdir(thumbnails_dir):
-            raise FileNotFoundError(f"{thumbnails_dir} is not a directory")
-        if not os.access(thumbnails_dir, os.W_OK | os.X_OK):
-            raise PermissionError(f"{thumbnails_dir} is not writable")
-        with tempfile.NamedTemporaryFile(dir=thumbnails_dir, prefix=".health-", delete=True) as tmp:
-            tmp.write(b"ok")
-            tmp.flush()
-        usage = shutil.disk_usage(thumbnails_dir)
-    except Exception as exc:
-        status["ok"] = False
-        status["error"] = str(exc)
-        return status
-
-    status["free_bytes"] = usage.free
-    status["total_bytes"] = usage.total
-    status["min_free_bytes"] = min_free_bytes
-    status["free_ok"] = usage.free >= min_free_bytes
-    status["ok"] = bool(status["free_ok"])
-    if not status["ok"]:
-        status["error"] = (
-            f"free disk below threshold: {_format_bytes(usage.free)} "
-            f"< {_format_bytes(min_free_bytes)}"
-        )
-    return status
-
-
-def _health_payload(
-    imgs_dir: str,
-    thumbnails_dir: str,
-    thumbnail_read_dirs: list[str],
-    health_min_free_bytes: int,
-) -> tuple[dict[str, object], int]:
-    optimized_webp = _check_optimized_webp_dirs(thumbnail_read_dirs)
-    fallback_source = _check_readable_dir(imgs_dir)
-    thumbnails = _check_thumbnails_write(thumbnails_dir, health_min_free_bytes)
-    source_available = bool(optimized_webp.get("ok")) or bool(fallback_source.get("ok"))
-    healthy = source_available and bool(thumbnails.get("ok"))
-
+    healthy = bool(root.get("ok")) and all(
+        bool(folder_status.get("ok")) for folder_status in folders.values()
+    )
     return {
         "status": "ok" if healthy else "error",
-        "source_available": source_available,
-        "checks": {
-            "optimized_webp": optimized_webp,
-            "fallback_source": fallback_source,
-            "thumbnails": thumbnails,
-        },
+        "mode": "grocery-images-only",
+        "read_only": True,
+        "checks": {"root": root, "folders": folders},
     }, (200 if healthy else 503)
 
 
-@contextmanager
-def _conversion_slot(state_dir: str, slot_count: int, timeout_seconds: int):
-    slots_dir = os.path.join(state_dir, CACHE_CONVERSION_SLOTS_DIR_NAME)
-    os.makedirs(slots_dir, exist_ok=True)
-
-    started_at = time.monotonic()
-    logged_wait = False
-    while True:
-        for slot_index in range(slot_count):
-            lock_path = os.path.join(slots_dir, f"slot-{slot_index}.lock")
-            lock_file = open(lock_path, "a+b")
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                lock_file.close()
-                continue
-            except OSError:
-                lock_file.close()
-                raise
-
-            wait_seconds = time.monotonic() - started_at
-            try:
-                yield slot_index, wait_seconds
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-                lock_file.close()
-            return
-
-        elapsed_seconds = time.monotonic() - started_at
-        if elapsed_seconds >= timeout_seconds:
-            logger.warning(
-                "Conversion slot timeout: pid=%s slots=%s wait_seconds=%.3f",
-                os.getpid(),
-                slot_count,
-                elapsed_seconds,
-            )
-            raise HTTPException(status_code=503, detail="Conversion capacity unavailable")
-
-        if not logged_wait and elapsed_seconds >= 1.0:
-            logger.info(
-                "Waiting for conversion slot: pid=%s slots=%s wait_seconds=%.3f",
-                os.getpid(),
-                slot_count,
-                elapsed_seconds,
-            )
-            logged_wait = True
-
-        time.sleep(0.1)
-
-
-def _file_response(path: str, media_type: str, cache_control: str) -> FileResponse:
-    return FileResponse(path, media_type=media_type, headers={"Cache-Control": cache_control})
-
-
-def find_alternate_document(folder: str, filename: str, imgs_dir: str) -> tuple[str, str] | None:
-    basename, ext = os.path.splitext(filename)
-    alternate_ext = DOCUMENT_ALTERNATE_EXTS.get(ext.lower())
-    if alternate_ext is None:
+def _image_media_type(filename: str) -> str | None:
+    media_type, _ = mimetypes.guess_type(filename)
+    if media_type is None or not media_type.startswith("image/"):
         return None
-
-    alternate_filename = f"{basename}{alternate_ext}"
-    alternate_path = os.path.join(imgs_dir, folder, alternate_filename)
-    if os.path.isfile(alternate_path):
-        return alternate_filename, alternate_path
-
-    return None
+    return media_type
 
 
-def document_redirect_url(request: Request, folder: str, filename: str) -> str:
-    url = f"/imgs/{quote(folder, safe='')}/{quote(filename, safe='')}"
-    if request.url.query:
-        url = f"{url}?{request.url.query}"
-    return url
-
-
-def promote_to_thumbnails(local_path: str, thumbnails_dir: str, folder: str, filename: str) -> bool:
-    """Copy a freshly-converted WebP into the thumbnails directory atomically.
-
-    Returns True on success, False on any OSError. Failure is logged at WARNING
-    but does not raise — the caller still serves the local bytes.
-    """
-    basename = os.path.splitext(filename)[0]
-    dest_dir = os.path.join(thumbnails_dir, folder)
-    dest_path = os.path.join(dest_dir, f"{basename}.webp")
-    tmp_name = f".{basename}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
-    tmp_path = os.path.join(dest_dir, tmp_name)
+def _is_file_within(path: str, directory: str) -> bool:
+    resolved_path = os.path.realpath(path)
+    resolved_directory = os.path.realpath(directory)
     try:
-        os.makedirs(dest_dir, exist_ok=True)
-        shutil.copyfile(local_path, tmp_path)
-        os.rename(tmp_path, dest_path)
-        logger.info(
-            "Promoted to thumbnails: pid=%s path=%s bytes=%s",
-            os.getpid(),
-            dest_path,
-            os.path.getsize(dest_path),
+        return (
+            os.path.commonpath((resolved_path, resolved_directory)) == resolved_directory
+            and os.path.isfile(resolved_path)
         )
+    except (OSError, ValueError):
+        return False
+
+
+def promote_to_thumbnails(
+    local_path: str,
+    thumbnails_dir: str,
+    folder: str,
+    filename: str,
+) -> bool:
+    """Compatibility helper for the standalone preconverter, not the web app."""
+    basename = os.path.splitext(filename)[0]
+    destination_dir = os.path.join(thumbnails_dir, folder)
+    destination = os.path.join(destination_dir, f"{basename}.webp")
+    temporary = os.path.join(
+        destination_dir,
+        f".{basename}.{os.getpid()}.{os.urandom(4).hex()}.tmp",
+    )
+    try:
+        os.makedirs(destination_dir, exist_ok=True)
+        shutil.copyfile(local_path, temporary)
+        os.replace(temporary, destination)
         return True
-    except OSError as exc:
-        logger.warning(
-            "Could not promote to thumbnails (serving anyway): pid=%s dest=%s error=%s",
-            os.getpid(),
-            dest_path,
-            exc,
-        )
+    except OSError:
         try:
-            os.unlink(tmp_path)
+            os.unlink(temporary)
         except OSError:
             pass
         return False
 
 
-promote_to_imgsbackup = promote_to_thumbnails
+def create_app(images_dir: str | None = None, log_config: bool = True) -> FastAPI:
+    app = FastAPI(title="imgServe groceryImgsOnly", docs_url=None, redoc_url=None)
+    app.state.images_dir = os.path.abspath(images_dir or DEFAULT_IMAGES_DIR)
 
-
-def _safe_unlink(path: str) -> None:
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
-
-
-def find_optimized_webp(folder: str, filename: str, thumbnail_read_dirs: list[str]) -> str | None:
-    basename = os.path.splitext(filename)[0]
-    webp_name = f"{basename}.webp"
-    for base in thumbnail_read_dirs:
-        candidate = os.path.join(base, folder, webp_name)
-        try:
-            if os.path.isfile(candidate):
-                return candidate
-        except OSError:
-            continue
-    return None
-
-
-def create_app(log_config: bool = True) -> FastAPI:
-    app = FastAPI(title="imgServe", docs_url=None, redoc_url=None)
-    app.state.imgs_dir = _configured_path(ENV_IMGS_DIR, DEFAULT_IMGS_BASE)
-    app.state.health_min_free_bytes = _configured_nonnegative_int(
-        ENV_HEALTH_MIN_FREE_BYTES,
-        DEFAULT_HEALTH_MIN_FREE_BYTES,
-    )
-    app.state.conversion_slots = _configured_positive_int(
-        ENV_CONVERSION_SLOTS,
-        DEFAULT_CONVERSION_SLOTS,
-    )
-    app.state.conversion_slot_timeout_seconds = _configured_nonnegative_int(
-        ENV_CONVERSION_SLOT_TIMEOUT_SECONDS,
-        DEFAULT_CONVERSION_SLOT_TIMEOUT_SECONDS,
-    )
-    app.state.thumbnails_dir = _configured_thumbnails_dir()
-    app.state.thumbnail_read_dirs = [app.state.thumbnails_dir]
-    app.state.state_dir = _configured_path(ENV_STATE_DIR, DEFAULT_STATE_DIR)
-    os.makedirs(app.state.state_dir, exist_ok=True)
     if log_config:
         logger.info(
-            "App configured: imgs_dir=%s thumbnails_write=%s thumbnail_read_dirs=%s state_dir=%s",
-            app.state.imgs_dir,
-            app.state.thumbnails_dir,
-            ", ".join(app.state.thumbnail_read_dirs),
-            app.state.state_dir,
+            "App configured: mode=grocery-images-only read_only=true images_dir=%s "
+            "allowed_folders=%s port=%s",
+            app.state.images_dir,
+            ",".join(sorted(ALLOWED_FOLDERS)),
+            DEFAULT_PORT,
         )
 
     @app.get("/health")
     def health(request: Request):
-        payload, status_code = _health_payload(
-            request.app.state.imgs_dir,
-            request.app.state.thumbnails_dir,
-            request.app.state.thumbnail_read_dirs,
-            request.app.state.health_min_free_bytes,
-        )
+        payload, status_code = _health_payload(request.app.state.images_dir)
         return JSONResponse(payload, status_code=status_code)
 
     @app.get("/imgs/{folder}/{filename}")
-    def serve_image(
-        request: Request,
-        folder: str,
-        filename: str,
-        format: str | None = Query(None, description="Output format: png, jpg, webp"),
-    ):
+    def serve_image(request: Request, folder: str, filename: str):
         folder = _validate_path_component(folder, "folder")
         filename = _validate_path_component(filename, "filename")
 
-        # 1. Cached canonical WebP — fast path.
-        if format is None or format.lower() == "webp":
-            optimized = find_optimized_webp(folder, filename, request.app.state.thumbnail_read_dirs)
-            if optimized is not None:
-                logger.debug(
-                    "Serving optimized WebP: pid=%s image=%s/%s path=%s",
-                    os.getpid(), folder, filename, optimized,
-                )
-                return _file_response(optimized, media_type="image/webp",
-                                      cache_control=IMMUTABLE_CACHE_CONTROL)
-
-        # 2. Source must exist.
-        src_path = os.path.join(request.app.state.imgs_dir, folder, filename)
-        if not os.path.isfile(src_path):
-            alternate = find_alternate_document(folder, filename, request.app.state.imgs_dir)
-            if alternate is not None:
-                alternate_filename, alternate_path = alternate
-                logger.info(
-                    "Redirecting missing document to alternate extension: pid=%s requested=%s/%s "
-                    "alternate=%s/%s path=%s",
-                    os.getpid(),
-                    folder,
-                    filename,
-                    folder,
-                    alternate_filename,
-                    alternate_path,
-                )
-                return RedirectResponse(
-                    document_redirect_url(request, folder, alternate_filename),
-                    status_code=307,
-                )
+        if folder not in ALLOWED_FOLDERS:
+            logger.info(
+                "Image request rejected: pid=%s reason=folder-not-allowed image=%s/%s",
+                os.getpid(),
+                folder,
+                filename,
+            )
             raise HTTPException(status_code=404, detail="Image not found")
 
-        ext = os.path.splitext(filename)[1].lower()
-
-        # 3. Passthrough — video, html, pdf, or anything we can't convert.
-        if is_passthrough(ext):
-            logger.debug(
-                "Passthrough source: pid=%s image=%s/%s ext=%s",
-                os.getpid(), folder, filename, ext,
-            )
-            return _file_response(
-                src_path,
-                media_type=get_content_type(ext),
-                cache_control=DIRECT_SOURCE_CACHE_CONTROL,
-            )
-
-        # 4. Decide output format.
-        if format:
-            fmt_lower = format.lower()
-            if fmt_lower not in FORMAT_TO_EXT:
-                raise HTTPException(status_code=400, detail=f"Unsupported format: {format}")
-            out_fmt = fmt_lower
-        else:
-            out_fmt = "webp"
-
-        out_ext = FORMAT_TO_EXT[out_fmt]
-        content_type = get_content_type(out_ext)
-
-        # 5. Convert in /tmp under a conversion slot.
-        src_size = os.path.getsize(src_path)
-        conversion_started_at = time.monotonic()
-        logger.info(
-            "Conversion queued: pid=%s image=%s/%s format=%s src_bytes=%s",
-            os.getpid(), folder, filename, out_fmt, src_size,
-        )
-
-        tmp_fd, tmp_out = tempfile.mkstemp(prefix="imgserve-", suffix=out_ext)
-        os.close(tmp_fd)
-        try:
-            with _conversion_slot(
-                request.app.state.state_dir,
-                slot_count=request.app.state.conversion_slots,
-                timeout_seconds=request.app.state.conversion_slot_timeout_seconds,
-            ) as (slot_index, slot_wait_seconds):
-                logger.info(
-                    "Conversion started: pid=%s slot=%s image=%s/%s format=%s slot_wait_seconds=%.3f",
-                    os.getpid(), slot_index, folder, filename, out_fmt, slot_wait_seconds,
-                )
-                success = convert_image(src_path, tmp_out, out_fmt)
-
-            if not success:
-                raise HTTPException(status_code=500, detail="Conversion failed")
-
-            output_bytes = os.path.getsize(tmp_out)
-            duration_seconds = time.monotonic() - conversion_started_at
-
-            # 6. Write-back only for canonical WebP. Fail-soft.
-            if out_fmt == "webp":
-                promote_to_thumbnails(
-                    tmp_out,
-                    request.app.state.thumbnails_dir,
-                    folder,
-                    filename,
-                )
-
+        media_type = _image_media_type(filename)
+        folder_path = os.path.join(request.app.state.images_dir, folder)
+        image_path = os.path.join(folder_path, filename)
+        if media_type is None or not _is_file_within(image_path, folder_path):
             logger.info(
-                "Conversion finished: pid=%s image=%s/%s format=%s duration_seconds=%.3f "
-                "src_bytes=%s output_bytes=%s",
-                os.getpid(), folder, filename, out_fmt, duration_seconds, src_size, output_bytes,
+                "Image request miss: pid=%s image=%s/%s path=%s",
+                os.getpid(),
+                folder,
+                filename,
+                image_path,
             )
+            raise HTTPException(status_code=404, detail="Image not found")
 
-            return FileResponse(
-                tmp_out,
-                media_type=content_type,
-                headers={"Cache-Control": IMMUTABLE_CACHE_CONTROL},
-                background=BackgroundTask(_safe_unlink, tmp_out),
-            )
-        except Exception:
-            # If we never returned a FileResponse, clean up the temp file now.
-            _safe_unlink(tmp_out)
-            raise
+        logger.info(
+            "Serving grocery image: pid=%s image=%s/%s path=%s",
+            os.getpid(),
+            folder,
+            filename,
+            image_path,
+        )
+        return FileResponse(
+            image_path,
+            media_type=media_type,
+            headers={"Cache-Control": IMMUTABLE_CACHE_CONTROL},
+        )
 
     return app
 
@@ -546,88 +192,33 @@ def create_app(log_config: bool = True) -> FastAPI:
 app = create_app(log_config=False)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="imgServe — Internal image server")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="imgServe — read-only groceryImgsOnly image server"
+    )
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8100, help="Port (default: 8100)")
     parser.add_argument(
-        "--imgs-dir",
-        default=DEFAULT_IMGS_BASE,
-        help=f"Source images directory (default: {DEFAULT_IMGS_BASE})",
-    )
-    parser.add_argument(
-        "--thumbnails-dir",
-        default=None,
-        help=f"Writable canonical WebP store (default: {DEFAULT_THUMBNAILS_DIR})",
-    )
-    parser.add_argument(
-        "--imgsbackup-dir",
-        dest="thumbnails_dir",
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--state-dir",
-        default=DEFAULT_STATE_DIR,
-        help=f"Directory for conversion slot lock files (default: {DEFAULT_STATE_DIR})",
-    )
-    parser.add_argument(
-        "--health-min-free-bytes",
+        "--port",
         type=int,
-        default=DEFAULT_HEALTH_MIN_FREE_BYTES,
-        help=f"Mark /health unhealthy below this thumbnails free-space floor (default: {DEFAULT_HEALTH_MIN_FREE_BYTES})",
+        default=DEFAULT_PORT,
+        help=f"Port (default: {DEFAULT_PORT})",
     )
     parser.add_argument(
-        "--conversion-slots",
+        "--workers",
         type=int,
-        default=DEFAULT_CONVERSION_SLOTS,
-        help=f"Cross-worker conversion slots on this host (default: {DEFAULT_CONVERSION_SLOTS})",
+        default=DEFAULT_WORKERS,
+        help=f"Number of workers (default: {DEFAULT_WORKERS})",
     )
-    parser.add_argument(
-        "--conversion-slot-timeout-seconds",
-        type=int,
-        default=DEFAULT_CONVERSION_SLOT_TIMEOUT_SECONDS,
-        help=(
-            "Maximum time a request waits for a conversion slot before returning 503 "
-            f"(default: {DEFAULT_CONVERSION_SLOT_TIMEOUT_SECONDS})"
-        ),
-    )
-    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
-                        help=f"Number of workers (default: {DEFAULT_WORKERS})")
     args = parser.parse_args()
 
-    if args.health_min_free_bytes < 0:
-        parser.error("--health-min-free-bytes must be >= 0")
-    if args.conversion_slots <= 0:
-        parser.error("--conversion-slots must be > 0")
-    if args.conversion_slot_timeout_seconds < 0:
-        parser.error("--conversion-slot-timeout-seconds must be >= 0")
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
     if args.workers <= 0:
         parser.error("--workers must be > 0")
 
-    imgs_dir = os.path.abspath(args.imgs_dir)
-    thumbnails_dir = os.path.abspath(
-        args.thumbnails_dir
-        or os.environ.get(ENV_THUMBNAILS_DIR)
-        or os.environ.get(ENV_LEGACY_IMGSBACKUP_DIR)
-        or DEFAULT_THUMBNAILS_DIR
-    )
-    state_dir = os.path.abspath(args.state_dir)
-    os.environ[ENV_IMGS_DIR] = imgs_dir
-    os.environ[ENV_THUMBNAILS_DIR] = thumbnails_dir
-    os.environ[ENV_STATE_DIR] = state_dir
-    os.environ[ENV_HEALTH_MIN_FREE_BYTES] = str(args.health_min_free_bytes)
-    os.environ[ENV_CONVERSION_SLOTS] = str(args.conversion_slots)
-    os.environ[ENV_CONVERSION_SLOT_TIMEOUT_SECONDS] = str(args.conversion_slot_timeout_seconds)
-    os.makedirs(state_dir, exist_ok=True)
-
-    logger.info("Optimized WebP read dirs: %s", thumbnails_dir)
-    logger.info("Source images: %s", imgs_dir)
-    logger.info("Thumbnails write target: %s", thumbnails_dir)
-    logger.info("State dir (conversion slot locks): %s", state_dir)
-    logger.info("Health min free bytes: %s", _format_bytes(args.health_min_free_bytes))
-    logger.info("Conversion slots: %s", args.conversion_slots)
-    logger.info("Conversion slot timeout seconds: %s", args.conversion_slot_timeout_seconds)
+    logger.info("Mode: grocery-images-only (read-only, exact-file lookup)")
+    logger.info("Image root: %s", DEFAULT_IMAGES_DIR)
+    logger.info("Allowed folders: %s", ", ".join(sorted(ALLOWED_FOLDERS)))
     logger.info("Listening on: %s:%s", args.host, args.port)
 
     uvicorn.run(
